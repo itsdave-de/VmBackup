@@ -10,7 +10,7 @@
 # Tobias Kreidl
 #
 # With external contributions gratefully made by:
-# @philippmk - 
+# @philippmk -
 # @ilium007 -
 # @HqWisen -
 # @JHag6694 -
@@ -32,6 +32,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+
+
 # Title: NAUbackup/VmBackup - a XenServer vm-export & vdi-export Backup Script
 # Package Contents: README.md, VmBackup.py (this file), example.cfg
 # Version History
@@ -45,6 +47,7 @@
 #         Add pre_clean option to delete oldest backups beforehand,
 #         fix subtle bug in pre-removing non-existing VMs from exclude list,
 #         add hostname to email subject line
+# - v3.22.itsdave 2018/07/30 Added function to exclude Disks starting with [NOBAK], like Xen Orcestra does
 # - v3.22 2017/11/11 Add full VM metadata dump to XML file to replace VM
 #         metadata backup that could fail if special characters encountered
 #         Added name_description UNICODE fix. (2018-Mar-20)
@@ -91,7 +94,7 @@ DEFAULT_BACKUP_DIR = '/snapshots/BACKUPS'
 ## DEFAULT_BACKUP_DIR = '\snapshots\BACKUPS' # alt for CIFS mounts
 # note - some NAS file servers may fail with ':', so change to your desired format
 BACKUP_DIR_PATTERN = '%s/backup-%04d-%02d-%02d-(%02d:%02d:%02d)'
-DEFAULT_STATUS_LOG = '/snapshots/NAUbackup/status.log'
+DEFAULT_STATUS_LOG = 'status.log'
 
 ############################# OPTIONAL
 # optional email may be triggered by configure next 3 parameters then find MAIL_ENABLE and uncommenting out the desired lines
@@ -104,17 +107,17 @@ config = {}
 all_vms = []
 expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'vdi_export_format', 'vm-export', 'vdi-export', 'exclude']
 message = ''
-xe_path = '/opt/xensource/bin' 
+xe_path = '/opt/xensource/bin'
 
-def main(session): 
+def main(session):
 
     success_cnt = 0
     warning_cnt = 0
-    error_cnt = 0 
+    error_cnt = 0
 
     #setting autoflush on (aka unbuffered)
     sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
-    
+
     server_name = os.uname()[1].split('.')[0]
     if config_specified:
         status_log_begin(server_name)
@@ -143,7 +146,7 @@ def main(session):
     if int(config['pool_db_backup']):
         log('*** begin backup_pool_metadata ***')
         if not backup_pool_metadata(server_name):
-            error_cnt += 1 
+            error_cnt += 1
 
     ######################################################################
     # Iterate through all vdi-export= in cfg
@@ -172,11 +175,11 @@ def main(session):
             # next vm
             continue
 
-        vm_backup_dir = os.path.join(config['backup_dir'], vm_name) 
+        vm_backup_dir = os.path.join(config['backup_dir'], vm_name)
         # cleanup any old unsuccessful backups and create new full_backup_dir
         full_backup_dir = process_backup_dir(vm_backup_dir)
 
-        # gather_vm_meta produces status: empty or warning-message 
+        # gather_vm_meta produces status: empty or warning-message
         #   and globals: vm_uuid, xvda_uuid, xvda_uuid
         #   => now only need: vm_uuid
         #   since all VM metadta go into an XML file
@@ -271,7 +274,7 @@ def main(session):
         # actual-backup: vdi-export vdi-snapshot
         cmd = '%s/xe vdi-export format=%s uuid=%s' % (xe_path, config['vdi_export_format'], snap_vdi_uuid)
         full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.%s' % config['vdi_export_format'])
-        cmd = '%s filename="%s"' % (cmd, full_path_backup_file) 
+        cmd = '%s filename="%s"' % (cmd, full_path_backup_file)
         log('4.cmd: %s' % cmd)
         if run_log_out_wait_rc(cmd) == 0:
             log('vdi-export success')
@@ -282,7 +285,7 @@ def main(session):
             error_cnt += 1
             # next vm
             continue
-    
+
         # cleanup: vdi-destroy vdi-snapshot
         cmd = '%s/xe vdi-destroy uuid=%s' % (xe_path, snap_vdi_uuid)
         log('5.cmd: %s' % cmd)
@@ -351,11 +354,11 @@ def main(session):
             # next vm
             continue
 
-        vm_backup_dir = os.path.join(config['backup_dir'], vm_name) 
+        vm_backup_dir = os.path.join(config['backup_dir'], vm_name)
         # cleanup any old unsuccessful backups and create new full_backup_dir
         full_backup_dir = process_backup_dir(vm_backup_dir)
 
-        # gather_vm_meta produces status: empty or warning-message 
+        # gather_vm_meta produces status: empty or warning-message
         #   and globals: vm_uuid, xvda_uuid, xvda_uuid
         vm_meta_status = gather_vm_meta(vm_object, full_backup_dir)
         if vm_meta_status != '':
@@ -427,7 +430,49 @@ def main(session):
             error_cnt += 1
             # next vm
             continue
-    
+
+        # exclude disk starting with [NOBAK]
+        cmd = '%s/xe vbd-list vm-uuid=%s params=uuid,vdi-name-label,vdi-uuid' % (xe_path, snap_vm_uuid)
+        log('2.5.cmd: %s' % cmd)
+        cmdoutput = run_log_out_wait_rc_ret_output(cmd)
+        vbds_to_delete = []
+        vdis_to_delete = []
+
+        for line in cmdoutput:
+            fields = line.split(':')
+            attrib = fields[0].strip()
+            value = fields[1].strip()
+            if attrib == 'uuid ( RO)':
+                current_vbd = value
+                continue
+            if attrib == 'vdi-uuid ( RO)':
+                current_vdi = value
+                continue
+            if attrib == 'vdi-name-label ( RO)':
+                if value.startswith('[NOBAK]'):
+                    vbds_to_delete.append(current_vbd)
+                    vdis_to_delete.append(current_vdi)
+            current_vbd = ''
+            current_vdi = ''
+
+        if len(vbds_to_delete) == 0:
+            log('no VBDs to exclude')
+        else:
+            log("deleting [NOBAK] VBDs and VDIs:")
+            for uuid in vbds_to_delete:
+                cmd = '%s/xe vbd-destroy uuid=%s' % (xe_path, uuid)
+                if run_log_out_wait_rc(cmd) == 0:
+                    log('SUCCESS %s' % cmd)
+                else:
+                    log('ERROR %s' % cmd)
+            for uuid in vdis_to_delete:
+                cmd = '%s/xe vdi-destroy uuid=%s' % (xe_path, uuid)
+                if run_log_out_wait_rc(cmd) == 0:
+                    log('SUCCESS %s' % cmd)
+                else:
+                    log('ERROR %s' % cmd)
+
+
         # vm-export vm-snapshot
         cmd = '%s/xe vm-export uuid=%s' % (xe_path, snap_vm_uuid)
         if compress:
@@ -435,7 +480,7 @@ def main(session):
             cmd = '%s filename="%s" compress=true' % (cmd, full_path_backup_file)
         else:
             full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva')
-            cmd = '%s filename="%s"' % (cmd, full_path_backup_file) 
+            cmd = '%s filename="%s"' % (cmd, full_path_backup_file)
         log('3.cmd: %s' % cmd)
         if run_log_out_wait_rc(cmd) == 0:
             log('vm-export success')
@@ -446,7 +491,7 @@ def main(session):
             error_cnt += 1
             # next vm
             continue
-    
+
         # vm-uninstall vm-snapshot
         cmd = '%s/xe vm-uninstall uuid=%s force=true' % (xe_path, snap_vm_uuid)
         log('4.cmd: %s' % cmd)
@@ -474,7 +519,7 @@ def main(session):
                 status_log_vm_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
 
         elif (this_status == 'warning'):
-            warning_cnt += 1 
+            warning_cnt += 1
             log('VmBackup vm-export %s - ***WARNING*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
             if config_specified:
                 status_log_vm_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
@@ -526,7 +571,7 @@ def isInt(s):
     except ValueError:
         return False
 
-def get_vm_max_backups(vm_parm): 
+def get_vm_max_backups(vm_parm):
     # get max_backups from optional vm-export=VM-NAME:MAX-BACKUP override
     # NOTE - if not present then return config['max_backups']
     if vm_parm.find(':') == -1:
@@ -539,7 +584,7 @@ def get_vm_max_backups(vm_parm):
         else:
             return int(config['max_backups'])
 
-def is_vm_backups_valid(vm_parm): 
+def is_vm_backups_valid(vm_parm):
     if vm_parm.find(':') == -1:
         # valid since we will use config['max_backups']
         return True
@@ -551,7 +596,7 @@ def is_vm_backups_valid(vm_parm):
         else:
             return False
 
-def get_vm_backups(vm_parm): 
+def get_vm_backups(vm_parm):
     # get max_backups from optional vm-export=VM-NAME:MAX-BACKUP override
     # NOTE - if not present then return empty string '' else return whatever specified after ':'
     if vm_parm.find(':') == -1:
@@ -560,7 +605,7 @@ def get_vm_backups(vm_parm):
         (vm_name,tmp_max_backups) = vm_parm.split(':')
         return tmp_max_backups
 
-def get_vm_name(vm_parm): 
+def get_vm_name(vm_parm):
     # get vm_name from optional vm-export=VM-NAME:MAX-BACKUP override
     if (vm_parm.find(':') == -1):
         return vm_parm
@@ -625,19 +670,19 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
 #    vm_out.write('orig_uuid=%s\n' % vm_record['uuid'])
 #    vm_uuid = vm_record['uuid']
 #    vm_out.close()
-#       
+#
     # Write metadata files for vdis and vbds.  These end up inside of a DISK- directory.
     log ('Writing disk info')
     vbd_cnt = 0
     for vbd in vm_record['VBDs']:
         log('vbd: %s' % vbd)
-        vbd_record = session.xenapi.VBD.get_record(vbd)  
+        vbd_record = session.xenapi.VBD.get_record(vbd)
         # For each vbd, find out if its a disk
         if vbd_record['type'].lower() != 'disk':
             continue
         vbd_record_device = vbd_record['device']
         if vbd_record_device == '':
-            # not normal - flag as warning. 
+            # not normal - flag as warning.
             # this seems to occur on some vms that have not been started in a long while,
             #   after starting the vm this blank condition seems to go away.
             tmp_error += 'empty vbd_record[device] on vbd: %s ' % vbd
@@ -691,7 +736,7 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
         device_path = '%s/VIFs' % tmp_full_backup_dir
         if (not os.path.exists(device_path)):
             os.mkdir(device_path)
-        vif_out = open('%s/vif-%s.cfg' % (device_path, vif_record['device']), 'w') 
+        vif_out = open('%s/vif-%s.cfg' % (device_path, vif_record['device']), 'w')
         vif_out.write('device=%s\n' % vif_record['device'])
         network_name = session.xenapi.network.get_record(vif_record['network'])['name_label']
         vif_out.write('network_name_label=%s\n' % network_name)
@@ -857,7 +902,7 @@ def backup_pool_metadata(svr_name):
 # some run notes with xe return code and output examples
 #  xe vm-lisX -> error .returncode=1 w/ error msg
 #  xe vm-list name-label=BAD-vm-name -> success .returncode=0 with no output
-#  xe pool-dump-database file-name=<dup-file-already-exists> 
+#  xe pool-dump-database file-name=<dup-file-already-exists>
 #     -> error .returncode=1 w/ error msg
 def run_log_out_wait_rc(cmd, log_w_timestamp=True):
     child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
@@ -866,6 +911,18 @@ def run_log_out_wait_rc(cmd, log_w_timestamp=True):
         log(line.rstrip("\n"), log_w_timestamp)
         line = child.stdout.readline()
     return child.wait()
+
+def run_log_out_wait_rc_ret_output(cmd, log_w_timestamp=True):
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+    line = child.stdout.readline()
+    output = []
+    while line:
+        linestring = line.strip()
+        if linestring != '':
+            log(line.rstrip("\n"), log_w_timestamp)
+            output.append(linestring)
+        line = child.stdout.readline()
+    return output
 
 def run_get_lastline(cmd):
     # exec cmd - expect 1 line output from cmd
@@ -888,7 +945,7 @@ def df_snapshots(log_msg):
         log(line)
 
 def send_email(to, subject, body_fname):
-    
+
     smtp_send_retries = 3
     smtp_send_attempt = 0
 
@@ -905,7 +962,7 @@ def send_email(to, subject, body_fname):
             print("Send email count limit exceeded")
             sys.exit(1)
         try:
-            # note if using an ipaddress in MAIL_SMTP_SERVER, 
+            # note if using an ipaddress in MAIL_SMTP_SERVER,
             # then may require smtplib.SMTP(MAIL_SMTP_SERVER, local_hostname="localhost")
 
             ## Optional use of SMTP user authentication via TLS
@@ -935,7 +992,7 @@ def send_email(to, subject, body_fname):
         except smtplib.SMTPException, e:
             print("Exception: SMTPException - %s" %e.message)
             time.sleep(5)
-            
+
 def is_xe_master():
     # test to see if we are running on xe master
 
@@ -956,15 +1013,15 @@ def is_config_valid():
     if not isInt(config['pool_db_backup']):
         print 'ERROR: config pool_db_backup non-numeric -> %s' % config['pool_db_backup']
         return False
- 
+
     if int(config['pool_db_backup']) != 0 and int(config['pool_db_backup']) != 1:
         print 'ERROR: config pool_db_backup out of range -> %s' % config['pool_db_backup']
         return False
- 
+
     if not isInt(config['max_backups']):
         print 'ERROR: config max_backups non-numeric -> %s' % config['max_backups']
         return False
- 
+
     if int(config['max_backups']) < 1:
         print 'ERROR: config max_backups out of range -> %s' % config['max_backups']
         return False
@@ -1006,7 +1063,7 @@ def config_load(path):
                 else:
                     print '***ERROR unexpected config key: %s' % key
                     return_value = False
-            
+
             if key == 'exclude':
                 save_to_config_exclude( key, value)
             elif key in ['vm-export','vdi-export']:
@@ -1460,7 +1517,7 @@ def usage_help():
 
 def usage_config_file():
     print 'Usage-config-file:'
-    print 
+    print
     print '  # Example config file for VmBackup.py'
     print
     print '  #### high level VmBackup settings ################'
@@ -1530,9 +1587,9 @@ def usage_examples():
 
 if __name__ == '__main__':
     if 'help' in sys.argv or 'config' in sys.argv or 'example' in sys.argv:
-        if 'help' in sys.argv: usage_help() 
-        if 'config' in sys.argv: usage_config_file() 
-        if 'example' in sys.argv: usage_examples() 
+        if 'help' in sys.argv: usage_help()
+        if 'config' in sys.argv: usage_config_file()
+        if 'example' in sys.argv: usage_examples()
         sys.exit(1)
     if len(sys.argv) < 3:
         usage()
@@ -1540,7 +1597,7 @@ if __name__ == '__main__':
     password = sys.argv[1]
     cfg_file = sys.argv[2]
     # obscure password support
-    if (os.path.exists(password)): 
+    if (os.path.exists(password)):
         password = base64.b64decode(open(password, 'r').read())
     if cfg_file.lower().startswith('create-password-file'):
         array = sys.argv[2].strip().split('=')
@@ -1605,7 +1662,7 @@ if __name__ == '__main__':
     config_load_defaults()  # set defaults that are not already loaded
     log('VmBackup config loaded from: %s' % cfg_file)
     config_print()     # show fully loaded config
-    
+
     if not is_config_valid():
         log('ERROR in configuration settings...')
         sys.exit(1)
