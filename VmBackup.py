@@ -80,6 +80,8 @@
 import sys, time, os, datetime, subprocess, re, shutil, smtplib, base64, socket, json, uuid as uuidlib
 import urllib.request, urllib.error
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate
 from subprocess import PIPE
 from subprocess import STDOUT
 
@@ -570,14 +572,21 @@ def main(session):
 
     # report to the itsdave backup API (schema naubackup-v1) and by mail; neither may change the result
     run_end = datetime.datetime.now()
+    data = None
     try:
-        report_finish(server_name, run_begin, run_end, overall, success_cnt, warning_cnt, error_cnt)
+        data = report_finish(server_name, run_begin, run_end, overall, success_cnt, warning_cnt, error_cnt)
     except Exception as e:
         log('WARNING report could not be built or sent: %s' % e)
 
     if mail_wanted(overall):
-        subject = {'error': 'ERROR', 'warning': 'WARNING', 'success': 'Success'}[overall]
-        send_email(mail_setting('mail_to', MAIL_TO_ADDR), '%s %s VmBackup.py' % (subject, os.uname()[1]), status_log)
+        word = {'error': 'ERROR', 'warning': 'WARNING', 'success': 'Success'}[overall]
+        subject = '%s %s VmBackup.py' % (word, os.uname()[1])
+        if data:
+            subject += ' - %s/%s VMs, %s, %s' % (success_cnt, data['run']['vm_count_configured'],
+                                                 fmt_bytes(sum(_num(v.get('size_bytes')) for v in data['vms'])),
+                                                 fmt_duration(data['run']['duration_sec']))
+        text, html = build_mail(data, status_log, overall)
+        send_email(mail_setting('mail_to', MAIL_TO_ADDR), subject, text, html)
         if config_specified:
             open('%s' % status_log, 'w').close() # trunc status log after email
 
@@ -711,18 +720,21 @@ def report_finish(server_name, run_begin, run_end, overall, success_cnt, warning
         log('WARNING could not write %s: %s' % (report_file, e))
 
     if not api_report_wanted():
-        return
+        return data
     token = secrets.get('api_token', '')
     if not token:
         log('WARNING api_report requested but no api_token in secrets file %s' % secrets_file)
-        return
+        return data
     api_url = (config_value('api_url') or DEFAULT_API_URL).rstrip('/')
     hostname = config_value('api_hostname') or os.uname()[1]
     ok, answer = post_report(api_url + '/backup', token, hostname, data)
     if ok:
         log('report sent to %s as %s: %s' % (api_url, hostname, answer[:200]))
+        data['run']['api_report'] = 'sent'
     else:
         log('WARNING report NOT sent to %s: %s' % (api_url, answer[:300]))
+        data['run']['api_report'] = 'failed: %s' % answer[:120]
+    return data
 
 def api_report_wanted():
     value = config_value('api_report').lower()
@@ -1195,19 +1207,157 @@ def mail_wanted(overall):
         return overall != 'success'
     return True
 
-def send_email(to, subject, body_fname):
+def _num(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def fmt_bytes(n):
+    n = _num(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1000 or unit == 'TB':
+            return ('%.0f %s' if unit in ('B', 'KB') else '%.1f %s') % (n, unit)
+        n /= 1000.0
+
+def fmt_duration(sec):
+    sec = int(_num(sec))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    if h:
+        return '%dh %02dm' % (h, m)
+    if m:
+        return '%dm %02ds' % (m, s)
+    return '%ds' % s
+
+def _esc(text):
+    return (str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+STATUS_WORD = {'success': 'Erfolgreich', 'warning': 'Mit Warnungen', 'error': 'Fehler'}
+STATUS_COLOR = {'success': '#2e7d32', 'warning': '#ef6c00', 'error': '#c62828', 'running': '#616161'}
+VM_MARK = {'success': 'OK', 'warning': 'WARN', 'error': 'FEHLER', 'running': '...'}
+
+def build_mail(data, status_log_file, overall):
+    """Plain text and HTML body for the report mail. Falls back to the status log alone."""
+    try:
+        with open('%s' % status_log_file, 'r') as f:
+            status_text = f.read()
+    except OSError:
+        status_text = message
+    if not data:
+        return status_text, None
+
+    run, host, ziel = data['run'], data['host'], data['target']
+    vms = data['vms']
+    total = sum(_num(v.get('size_bytes')) for v in vms)
+    used_pct = ziel.get('used_pct')
+    state = ziel.get('target_state') or {}
+
+    # ---- text
+    lines = []
+    lines.append('NAUbackup %s auf %s: %s' % (VERSION, host.get('fqdn'), STATUS_WORD.get(overall, overall)))
+    lines.append('%s bis %s (%s), %s/%s VMs, %s gesamt, Kompression %s' % (
+        run['started_at'].replace('T', ' '), run['ended_at'][11:], fmt_duration(run['duration_sec']),
+        run['success_count'], run['vm_count_configured'], fmt_bytes(total), run.get('compress')))
+    lines.append('')
+    lines.append('%-24s %-8s %-9s %-10s %s' % ('VM', 'Status', 'Dauer', 'Groesse', 'Kopien'))
+    for v in vms:
+        lines.append('%-24s %-8s %-9s %-10s %s%s' % (
+            v.get('name', '')[:24], VM_MARK.get(v.get('status'), v.get('status')),
+            fmt_duration(v.get('duration_sec')), fmt_bytes(v.get('size_bytes')) if v.get('size_bytes') is not None else '-',
+            v.get('copies') if v.get('copies') is not None else '-',
+            ('  (%s)' % v.get('message')) if v.get('status') != 'success' and v.get('message') else ''))
+        if v.get('excluded_disks'):
+            lines.append('%-24s   ausgelassen: %s' % ('', ', '.join(v['excluded_disks'])))
+    lines.append('')
+    lines.append('Ziel: %s%s' % (ziel.get('backup_dir'), (' auf %s' % state.get('target_id')) if state.get('target_id') else ''))
+    if used_pct is not None:
+        lines.append('      %s belegt, %s frei von %s (%s %%)' % (fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct))
+    if state.get('target_serial'):
+        lines.append('      Seriennummer %s' % state.get('target_serial'))
+    pm = data.get('pool_metadata') or {}
+    if pm.get('enabled'):
+        lines.append('Pool-Metadaten: %s' % ('gesichert' if pm.get('success') else 'FEHLER'))
+    if run.get('api_report'):
+        lines.append('Leitstand-Report: %s' % run.get('api_report'))
+    lines.append('')
+    lines.append('--- Protokoll (status.log) ---')
+    lines.append(status_text.rstrip())
+    text = '\n'.join(lines) + '\n'
+
+    # ---- html
+    color = STATUS_COLOR.get(overall, '#616161')
+    rows = []
+    for v in vms:
+        vc = STATUS_COLOR.get(v.get('status'), '#616161')
+        extra = ''
+        if v.get('status') != 'success' and v.get('message'):
+            extra += '<div style="color:%s;font-size:12px">%s</div>' % (vc, _esc(v.get('message')))
+        if v.get('excluded_disks'):
+            extra += '<div style="color:#616161;font-size:12px">ausgelassen: %s</div>' % _esc(', '.join(v['excluded_disks']))
+        rows.append(
+            '<tr>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee"><b>%s</b>%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;color:%s;font-weight:bold">%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;color:#616161;font-size:12px">%s</td>'
+            '</tr>' % (
+                _esc(v.get('name', '')), extra, vc, VM_MARK.get(v.get('status'), _esc(v.get('status'))),
+                fmt_duration(v.get('duration_sec')),
+                fmt_bytes(v.get('size_bytes')) if v.get('size_bytes') is not None else '-',
+                v.get('copies') if v.get('copies') is not None else '-',
+                _esc(v.get('mode', '')) + (', ' + _esc(v.get('power_state')) if v.get('power_state') else '')))
+    bar = ''
+    if used_pct is not None:
+        pct = max(0, min(100, _num(used_pct)))
+        bar_color = '#2e7d32' if pct < 80 else ('#ef6c00' if pct < 90 else '#c62828')
+        bar = ('<div style="background:#eee;border-radius:4px;height:10px;width:260px;margin-top:4px">'
+               '<div style="background:%s;height:10px;border-radius:4px;width:%d%%"></div></div>'
+               '<div style="font-size:12px;color:#616161">%s belegt, %s frei von %s (%s %%)</div>') % (
+                   bar_color, int(pct), fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct)
+    facts = [
+        ('Host', '%s (%s %s)' % (_esc(host.get('fqdn')), _esc(host.get('product') or ''), _esc(host.get('version') or ''))),
+        ('Zeitraum', '%s bis %s, %s' % (_esc(run['started_at'].replace('T', ' ')), _esc(run['ended_at'][11:]), fmt_duration(run['duration_sec']))),
+        ('VMs', '%s von %s erfolgreich, %s Warnung(en), %s Fehler' % (run['success_count'], run['vm_count_configured'], run['warning_count'], run['error_count'])),
+        ('Datenmenge', '%s, Kompression %s' % (fmt_bytes(total), _esc(run.get('compress')))),
+        ('Ziel', '%s%s%s' % (_esc(ziel.get('backup_dir')), (' auf <code>%s</code>' % _esc(state.get('target_id'))) if state.get('target_id') else '',
+                             (' (S/N %s)' % _esc(state.get('target_serial'))) if state.get('target_serial') else '') + bar),
+    ]
+    if pm.get('enabled'):
+        facts.append(('Pool-Metadaten', '<span style="color:%s">%s</span>' % (STATUS_COLOR['success'] if pm.get('success') else STATUS_COLOR['error'], 'gesichert' if pm.get('success') else 'FEHLER')))
+    if run.get('api_report'):
+        facts.append(('Leitstand-Report', _esc(run.get('api_report'))))
+    fact_rows = ''.join('<tr><td style="padding:3px 12px 3px 0;color:#616161;white-space:nowrap;vertical-align:top">%s</td><td style="padding:3px 0">%s</td></tr>' % (k, v) for k, v in facts)
+    html = (
+        '<html><body style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;font-size:14px;color:#212121;margin:0;padding:16px">'
+        '<div style="border-left:6px solid %s;padding:10px 14px;background:#fafafa;margin-bottom:16px">'
+        '<div style="font-size:18px;font-weight:bold;color:%s">%s</div>'
+        '<div style="color:#616161">NAUbackup %s</div></div>'
+        '<table style="border-collapse:collapse;margin-bottom:16px">%s</table>'
+        '<table style="border-collapse:collapse;min-width:620px">'
+        '<tr style="background:#f0f0f0"><th style="text-align:left;padding:6px 10px">VM</th><th style="text-align:left;padding:6px 10px">Status</th>'
+        '<th style="text-align:right;padding:6px 10px">Dauer</th><th style="text-align:right;padding:6px 10px">Gr&ouml;&szlig;e</th>'
+        '<th style="text-align:right;padding:6px 10px">Kopien</th><th style="text-align:left;padding:6px 10px">Modus</th></tr>%s</table>'
+        '<details style="margin-top:20px"><summary style="color:#616161;cursor:pointer">Protokoll (status.log)</summary>'
+        '<pre style="font-size:11px;color:#424242;background:#fafafa;padding:8px;overflow:auto">%s</pre></details>'
+        '</body></html>'
+    ) % (color, color, STATUS_WORD.get(overall, _esc(overall)), VERSION, fact_rows, ''.join(rows), _esc(status_text.rstrip()))
+    return text, html
+
+def send_email(to, subject, body_text, body_html=None):
 
     smtp_send_retries = 3
     smtp_send_attempt = 0
 
-    try:
-        with open('%s' % body_fname, 'r') as f:
-            body = f.read()
-    except OSError:
-        body = message
-
-    msg = MIMEText(body)
-    msg['subject'] = subject
+    if body_html:
+        msg = MIMEMultipart('alternative')
+        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+        msg.attach(MIMEText(body_html, 'html', 'utf-8'))
+    else:
+        msg = MIMEText(body_text, 'plain', 'utf-8')
+    msg['Subject'] = subject
     mail_from = mail_setting('mail_from', MAIL_FROM_ADDR)
     server = mail_setting('mail_smtp_server', MAIL_SMTP_SERVER)
     port = int(mail_setting('mail_smtp_port') or DEFAULT_MAIL_SMTP_PORT)
@@ -1215,6 +1365,7 @@ def send_email(to, subject, body_fname):
     password = secrets.get('mailpass', '')
     msg['From'] = mail_from
     msg['To'] = to
+    msg['Date'] = formatdate(localtime=True)
 
     while smtp_send_attempt < smtp_send_retries:
         smtp_send_attempt += 1
