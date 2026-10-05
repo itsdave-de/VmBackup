@@ -335,7 +335,9 @@ def main(session):
 
         vm_report['file'] = full_path_backup_file
         vm_report['size_bytes'] = backup_file_bytes
-        vm_report['copies'] = count_successful_backups(vm_backup_dir)
+        vm_report['copies_detail'] = backup_copies(vm_backup_dir)
+        vm_report['copies'] = len([c for c in vm_report['copies_detail'] if c['success']])
+        vm_report['on_disk_bytes'] = sum(c['size_bytes'] for c in vm_report['copies_detail'])
         elapse_min = elapseTime.seconds // 60
         if (this_status == 'success'):
             success_cnt += 1
@@ -521,7 +523,9 @@ def main(session):
 
         vm_report['file'] = full_path_backup_file
         vm_report['size_bytes'] = backup_file_bytes
-        vm_report['copies'] = count_successful_backups(vm_backup_dir)
+        vm_report['copies_detail'] = backup_copies(vm_backup_dir)
+        vm_report['copies'] = len([c for c in vm_report['copies_detail'] if c['success']])
+        vm_report['on_disk_bytes'] = sum(c['size_bytes'] for c in vm_report['copies_detail'])
         elapse_min = elapseTime.seconds // 60
         if (this_status == 'success'):
             success_cnt += 1
@@ -625,19 +629,38 @@ def report_vm_end(entry, status, text):
     except ValueError:
         entry['duration_sec'] = None
 
+def dir_size(path):
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+def backup_copies(path):
+    # the restorable copies the target holds for this VM: directory, date (from the name), size, newest first
+    try:
+        dirs = sorted(os.listdir(path), reverse=True)
+    except OSError:
+        return []
+    copies = []
+    for d in dirs:
+        full = os.path.join(path, d)
+        if not os.path.isdir(full):
+            continue
+        ok = any(os.path.exists(os.path.join(full, marker))
+                 for marker in ('success', 'success_restore', 'success_compress', 'success_compressing'))
+        copies.append({'dir': d, 'success': ok, 'size_bytes': dir_size(full)})
+    return copies
+
 def count_successful_backups(path):
     # how many restorable copies the target holds for this VM
-    try:
-        dirs = os.listdir(path)
-    except OSError:
+    copies = backup_copies(path)
+    if not copies and not os.path.isdir(path):
         return None
-    cnt = 0
-    for d in dirs:
-        for marker in ('success', 'success_restore', 'success_compress', 'success_compressing'):
-            if os.path.exists(os.path.join(path, d, marker)):
-                cnt += 1
-                break
-    return cnt
+    return len([c for c in copies if c['success']])
 
 def target_info(path):
     info = {'backup_dir': path}
@@ -1233,6 +1256,20 @@ def fmt_duration(sec):
 def _esc(text):
     return (str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
+def copies_label(v):
+    # "2 / 2" = vorhandene restaurierbare Kopien / konfiguriertes max_backups
+    have = v.get('copies')
+    want = v.get('max_backups')
+    if have is None:
+        return '-'
+    return '%s / %s' % (have, want) if want else str(have)
+
+def copy_label(c):
+    # Verzeichnisname backup-2026-10-06-(01:00:02) -> "2026-10-06 402.0 GB"
+    m = re.match(r'backup-(\d{4}-\d{2}-\d{2})', c.get('dir', ''))
+    day = m.group(1) if m else c.get('dir', '')
+    return '%s %s%s' % (day, fmt_bytes(c.get('size_bytes')), '' if c.get('success') else ' (unvollstaendig)')
+
 STATUS_WORD = {'success': 'Erfolgreich', 'warning': 'Mit Warnungen', 'error': 'Fehler'}
 STATUS_COLOR = {'success': '#2e7d32', 'warning': '#ef6c00', 'error': '#c62828', 'running': '#616161'}
 VM_MARK = {'success': 'OK', 'warning': 'WARN', 'error': 'FEHLER', 'running': '...'}
@@ -1260,19 +1297,22 @@ def build_mail(data, status_log_file, overall):
         run['started_at'].replace('T', ' '), run['ended_at'][11:], fmt_duration(run['duration_sec']),
         run['success_count'], run['vm_count_configured'], fmt_bytes(total), run.get('compress')))
     lines.append('')
-    lines.append('%-24s %-8s %-9s %-10s %s' % ('VM', 'Status', 'Dauer', 'Groesse', 'Kopien'))
+    lines.append('%-24s %-8s %-9s %-10s %-9s %s' % ('VM', 'Status', 'Dauer', 'Groesse', 'Kopien', 'auf Platte'))
     for v in vms:
-        lines.append('%-24s %-8s %-9s %-10s %s%s' % (
+        lines.append('%-24s %-8s %-9s %-10s %-9s %s%s' % (
             v.get('name', '')[:24], VM_MARK.get(v.get('status'), v.get('status')),
             fmt_duration(v.get('duration_sec')), fmt_bytes(v.get('size_bytes')) if v.get('size_bytes') is not None else '-',
-            v.get('copies') if v.get('copies') is not None else '-',
+            copies_label(v), fmt_bytes(v.get('on_disk_bytes')) if v.get('on_disk_bytes') is not None else '-',
             ('  (%s)' % v.get('message')) if v.get('message') and v.get('message') not in ('SUCCESS', 'WARNING') else ''))
+        if v.get('copies_detail'):
+            lines.append('%-24s   Kopien: %s' % ('', ', '.join(copy_label(c) for c in v['copies_detail'])))
         if v.get('excluded_disks'):
             lines.append('%-24s   ausgelassen: %s' % ('', ', '.join(v['excluded_disks'])))
+    on_disk_total = sum(_num(v.get('on_disk_bytes')) for v in vms)
     lines.append('')
     lines.append('Ziel: %s%s' % (ziel.get('backup_dir'), (' auf %s' % state.get('target_id')) if state.get('target_id') else ''))
     if used_pct is not None:
-        lines.append('      %s belegt, %s frei von %s (%s %%)' % (fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct))
+        lines.append('      %s belegt, %s frei von %s (%s %%); diese VMs mit allen Kopien: %s' % (fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct, fmt_bytes(on_disk_total)))
     if state.get('target_serial'):
         lines.append('      Seriennummer %s' % state.get('target_serial'))
     pm = data.get('pool_metadata') or {}
@@ -1295,19 +1335,23 @@ def build_mail(data, status_log_file, overall):
             extra += '<div style="color:%s;font-size:12px">%s</div>' % (vc, _esc(v.get('message')))
         if v.get('excluded_disks'):
             extra += '<div style="color:#616161;font-size:12px">ausgelassen: %s</div>' % _esc(', '.join(v['excluded_disks']))
+        if v.get('copies_detail'):
+            extra += '<div style="color:#616161;font-size:12px">Kopien: %s</div>' % _esc(', '.join(copy_label(c) for c in v['copies_detail']))
         rows.append(
             '<tr>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee"><b>%s</b>%s</td>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee;color:%s;font-weight:bold">%s</td>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
+            '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">%s</td>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right">%s</td>'
             '<td style="padding:6px 10px;border-bottom:1px solid #eee;color:#616161;font-size:12px">%s</td>'
             '</tr>' % (
                 _esc(v.get('name', '')), extra, vc, VM_MARK.get(v.get('status'), _esc(v.get('status'))),
                 fmt_duration(v.get('duration_sec')),
                 fmt_bytes(v.get('size_bytes')) if v.get('size_bytes') is not None else '-',
-                v.get('copies') if v.get('copies') is not None else '-',
+                copies_label(v),
+                fmt_bytes(v.get('on_disk_bytes')) if v.get('on_disk_bytes') is not None else '-',
                 _esc(v.get('mode', '')) + (', ' + _esc(v.get('power_state')) if v.get('power_state') else '')))
     bar = ''
     if used_pct is not None:
@@ -1315,8 +1359,8 @@ def build_mail(data, status_log_file, overall):
         bar_color = '#2e7d32' if pct < 80 else ('#ef6c00' if pct < 90 else '#c62828')
         bar = ('<div style="background:#eee;border-radius:4px;height:10px;width:260px;margin-top:4px">'
                '<div style="background:%s;height:10px;border-radius:4px;width:%d%%"></div></div>'
-               '<div style="font-size:12px;color:#616161">%s belegt, %s frei von %s (%s %%)</div>') % (
-                   bar_color, int(pct), fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct)
+               '<div style="font-size:12px;color:#616161">%s belegt, %s frei von %s (%s %%); diese VMs mit allen Kopien: %s</div>') % (
+                   bar_color, int(pct), fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct, fmt_bytes(on_disk_total))
     facts = [
         ('Host', '%s (%s %s)' % (_esc(host.get('fqdn')), _esc(host.get('product') or ''), _esc(host.get('version') or ''))),
         ('Zeitraum', '%s bis %s, %s' % (_esc(run['started_at'].replace('T', ' ')), _esc(run['ended_at'][11:]), fmt_duration(run['duration_sec']))),
@@ -1339,7 +1383,7 @@ def build_mail(data, status_log_file, overall):
         '<table style="border-collapse:collapse;min-width:620px">'
         '<tr style="background:#f0f0f0"><th style="text-align:left;padding:6px 10px">VM</th><th style="text-align:left;padding:6px 10px">Status</th>'
         '<th style="text-align:right;padding:6px 10px">Dauer</th><th style="text-align:right;padding:6px 10px">Gr&ouml;&szlig;e</th>'
-        '<th style="text-align:right;padding:6px 10px">Kopien</th><th style="text-align:left;padding:6px 10px">Modus</th></tr>%s</table>'
+        '<th style="text-align:right;padding:6px 10px">Kopien</th><th style="text-align:right;padding:6px 10px">auf Platte</th><th style="text-align:left;padding:6px 10px">Modus</th></tr>%s</table>'
         '<details style="margin-top:20px"><summary style="color:#616161;cursor:pointer">Protokoll (status.log)</summary>'
         '<pre style="font-size:11px;color:#424242;background:#fafafa;padding:8px;overflow:auto">%s</pre></details>'
         '</body></html>'
