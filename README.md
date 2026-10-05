@@ -17,7 +17,49 @@ Copyright (C) 2019  Northern Arizona University
 
 **Package Contents:** README.md (this file), VmBackup.py, example.cfg
 
+## itsdave fork (V4.0.0-itsdave, Python 3)
+
+This fork is maintained by itsdave GmbH for our XCP-ng 8.x fleet. Upstream has
+been dormant since 3.25 (2019); the branch `itsdave` carries:
+
+- **Python 3** (3.6+, the dom0 of XCP-ng 8.x). The script runs with `python3`,
+  no Python 2 left. Output is flushed line by line, so `runBackup.log` is live.
+- **`[NOBAK]` disks are excluded**, the same convention Xen Orchestra uses: a
+  VDI whose name-label starts with `[NOBAK]` is removed from the *snapshot*
+  before the export. The original VM is untouched.
+- **`compress=none|gzip|zstd`** on the command line or in the config file.
+  `zstd` needs `xe vm-export compress=zstd` (XCP-ng 8.1+) and writes
+  `<vm>.xva.zst`; it is many times faster than gzip, which runs single-threaded.
+  `true`/`false` still work and mean gzip/none.
+- **No root password on the host:** pass the word `local` instead of the
+  password and the script talks to xapi over its unix socket. With a password
+  it uses `https://localhost/` with `ignore_ssl` (self-signed certificate) and
+  follows `HOST_IS_SLAVE` to the pool master as before.
+- **Secrets file** (`secrets_file=`, default `/root/naubackup/.secrets`,
+  `key=value`, chmod 600): `mailuser`, `mailpass`, `api_token`. Nothing secret
+  lives in the script any more; `runBackup.sh` reads `lukspass` from the same
+  file. See `deploy/secrets.example`.
+- **Mail settings in the config file** (`mail_to`, `mail_from`,
+  `mail_smtp_server`, `mail_smtp_port`, `mail_mode=always|problems|never`).
+  Port 587 uses STARTTLS, 465 implicit TLS, 25 STARTTLS when offered.
+- **JSON report** after every run (`last_report.json` next to the status log,
+  schema `naubackup-v1`: host, run, target disk, one entry per VM with status,
+  duration, size, copies, excluded disks). With `api_token` set it is posted to
+  the itsdave backup API (`api_url`, default `https://backupapi.itsdave.de/api/v1`,
+  multipart `hostname` / `backup_type=naubackup-v1` / `backuplog`). Reporting
+  problems are logged as WARNING and never change the backup result.
+- **Exit codes:** 0 success, 1 warnings, 2 errors or fatal configuration error
+  (upstream always exited 0).
+- **Log format kept** (`*** success: <file> : <n>G`, `t:<minutes>`,
+  `VmBackup ended - ... S:n W:n E:n`), so the existing `check_naubackup` NRPE
+  check keeps working.
+
+Deployment template for a rotating LUKS disk: `deploy/runBackup.sh`.
+
 ## Version History:
+
+- v4.0.0-itsdave 2026/10/05 Python 3, compress=none|gzip|zstd, local xapi socket, secrets file, mail settings in config, JSON report to the itsdave backup API, exit codes. See "itsdave fork" above.
+- v3.22.itsdave 2018/07/30 exclude disks whose VDI name-label starts with [NOBAK]
  - v3.25 2019/06/07 Reconcile XenAPI.Session to be compatible with 6.X - 8.X releases,
          alert users in README file that session.xenapi.VM.get_by_name_label also returns name_labels
          of templates and hence should be avoided for VMs.

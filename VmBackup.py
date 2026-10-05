@@ -1,12 +1,11 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+# V4.0.0-itsdave October 2026
 #
-#NAUVmBackup/VmBackup.py
-# V3.25 August 2019
+# Copyright (C) 2018  Northern Arizona University
+# Copyright (C) 2026  itsdave GmbH (Python-3-Port, zstd, Secrets, API-Reporting)
 #
-#@NAUbackup - NAU/ITS Department:
+# Initial Authors:
 # Douglas Pace
-# David McArthur
-# Duane Booher
 # Tobias Kreidl
 #
 # With external contributions gratefully made by:
@@ -14,29 +13,30 @@
 # @ilium007 -
 # @HqWisen -
 # @JHag6694 -
-# @lancefogle - Lance Fogle
-# Tom McKelvey
-
-# Copyright (C) 2019  Northern Arizona University
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
-
-# Title: NAUbackup/VmBackup - a XenServer vm-export & vdi-export Backup Script
-# Package Contents: README.md, VmBackup.py (this file), example.cfg
+# Title: NAUbackup/VmBackup - a XenServer/XCP-ng vm-export & vdi-export Backup Script
+# Package Contents: README.md, VmBackup.py (this file), example.cfg, deploy/
 # Version History
+# - v4.0.0-itsdave 2026/10/05 Python 3 (3.6+, XCP-ng 8.x dom0), compress=none|gzip|zstd,
+#         XenAPI over the local unix socket (password "local", no root password
+#         needed on the host), SMTP credentials and API token from a secrets
+#         file instead of the script, mail settings in the config file,
+#         JSON report (schema naubackup-v1) posted to the itsdave backup API,
+#         exit code 2 on errors / 1 on warnings, output flushed line by line.
+# - v3.22.itsdave 2018/07/30 Added function to exclude Disks starting with [NOBAK], like Xen Orchestra does
 # - v3.25 2019/08/07 Reconcile XenAPI.Session to be compatible
 #         with XenServer 6.X - 8.X releases, alert users in README file that
 #         session.xenapi.VM.get_by_name_label also returns name_labels
@@ -47,11 +47,9 @@
 #         Add pre_clean option to delete oldest backups beforehand,
 #         fix subtle bug in pre-removing non-existing VMs from exclude list,
 #         add hostname to email subject line
-# - v3.22.itsdave 2018/07/30 Added function to exclude Disks starting with [NOBAK], like Xen Orcestra does
 # - v3.22 2017/11/11 Add full VM metadata dump to XML file to replace VM
 #         metadata backup that could fail if special characters encountered
 #         Added name_description UNICODE fix. (2018-Mar-20)
-#         Fixed bug in global definitions for vdi-export case. (2018-Mar-20)
 # - v3.21 2017/09/29 Fix "except socket.error" syntax to also work with older
 #         python version in XenServer 6.X
 # - v3.2  2017/09/12 Fix wildcard handling and excludes for both VM and VDI
@@ -74,16 +72,21 @@
 # See example.cfg for config file example usage.
 
 # Usage w/ vm name for single vm backup, which runs vm-export by default:
-#    ./VmBackup.py <password> <vm-name>
+#    ./VmBackup.py <password|local> <vm-name>
 
 # Usage w/ config file for multiple vm backups, where you can specify either vm-export or vdi-export:
-#    ./VmBackup.py <password> <config-file-path>
+#    ./VmBackup.py <password|local> <config-file-path>
 
-import sys, time, os, datetime, subprocess, re, shutil, XenAPI, smtplib, re, base64, socket, threading, ssl
-from email.MIMEText import MIMEText
+import sys, time, os, datetime, subprocess, re, shutil, smtplib, base64, socket, json, uuid as uuidlib
+import urllib.request, urllib.error
+from email.mime.text import MIMEText
 from subprocess import PIPE
 from subprocess import STDOUT
-from os.path import join
+
+import XenAPI
+
+VERSION = 'V4.0.0-itsdave'
+REPORT_SCHEMA = 'naubackup-v1'
 
 ############################# HARD CODED DEFAULTS
 # modify these hard coded default values, only used if not specified in config file
@@ -95,35 +98,42 @@ DEFAULT_BACKUP_DIR = '/snapshots/BACKUPS'
 # note - some NAS file servers may fail with ':', so change to your desired format
 BACKUP_DIR_PATTERN = '%s/backup-%04d-%02d-%02d-(%02d:%02d:%02d)'
 DEFAULT_STATUS_LOG = 'status.log'
+DEFAULT_COMPRESS = 'none'          # none | gzip | zstd  (zstd needs XCP-ng 8.1+ / XenServer 8.x)
+DEFAULT_SECRETS_FILE = '/root/naubackup/.secrets'
+DEFAULT_MAIL_SMTP_PORT = 25
+DEFAULT_MAIL_MODE = 'always'       # always | problems | never  (only if mail_to is set)
+DEFAULT_API_URL = 'https://backupapi.itsdave.de/api/v1'
 
-############################# OPTIONAL
-# optional email may be triggered by configure next 3 parameters then find MAIL_ENABLE and uncommenting out the desired lines
-MAIL_TO_ADDR = 'your-email@your-domain'
-# note if MAIL_TO_ADDR has ipaddr then you may need to change the smtplib.SMTP() call
-MAIL_FROM_ADDR = 'your-from-address@your-domain'
-MAIL_SMTP_SERVER = 'your-mail-server'
+############################# OPTIONAL (legacy fallbacks, prefer the config file keys mail_to / mail_from / mail_smtp_server)
+MAIL_TO_ADDR = ''
+MAIL_FROM_ADDR = ''
+MAIL_SMTP_SERVER = ''
 
 config = {}
+secrets = {}
 all_vms = []
-expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'vdi_export_format', 'vm-export', 'vdi-export', 'exclude']
+expected_keys = ['pool_db_backup', 'max_backups', 'backup_dir', 'status_log', 'vdi_export_format', 'vm-export', 'vdi-export', 'exclude',
+                 'compress', 'mail_to', 'mail_from', 'mail_smtp_server', 'mail_smtp_port', 'mail_mode',
+                 'api_url', 'api_hostname', 'api_report']
 message = ''
 xe_path = '/opt/xensource/bin'
+
+# collected for the JSON report (schema naubackup-v1)
+report = {'vms': [], 'pool_metadata': {'enabled': False, 'success': None}}
 
 def main(session):
 
     success_cnt = 0
     warning_cnt = 0
     error_cnt = 0
-
-    #setting autoflush on (aka unbuffered)
-    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
+    run_begin = datetime.datetime.now()
 
     server_name = os.uname()[1].split('.')[0]
     if config_specified:
         status_log_begin(server_name)
 
     log('===========================')
-    log('VmBackup running on %s ...' % server_name)
+    log('VmBackup %s running on %s ...' % (VERSION, server_name))
 
     log('===========================')
     log('Check if backup directory %s is writable ...' % config['backup_dir'])
@@ -134,7 +144,7 @@ def main(session):
     res = run(cmd)
     if not res:
         log('ERROR failed to write to backup directory area - FATAL ERROR')
-        sys.exit(1)
+        sys.exit(2)
     else:
         cmd = '/bin/rm -f "%s"' % touchfile
         res = run(cmd)
@@ -145,8 +155,12 @@ def main(session):
 
     if int(config['pool_db_backup']):
         log('*** begin backup_pool_metadata ***')
+        report['pool_metadata']['enabled'] = True
         if not backup_pool_metadata(server_name):
             error_cnt += 1
+            report['pool_metadata']['success'] = False
+        else:
+            report['pool_metadata']['success'] = True
 
     ######################################################################
     # Iterate through all vdi-export= in cfg
@@ -160,6 +174,7 @@ def main(session):
         vm_name = get_vm_name(vm_parm)
         vm_max_backups = get_vm_max_backups(vm_parm)
         log('vdi-export - vm_name: %s max_backups: %s' % (vm_name, vm_max_backups))
+        vm_report = report_vm_begin(vm_name, 'vdi-export', vm_max_backups, beginTime)
 
         if config_specified:
             status_log_vdi_export_begin(server_name, '%s' % vm_name)
@@ -172,6 +187,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'ERROR verify_vm_name %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'verify_vm_name')
             # next vm
             continue
 
@@ -195,6 +211,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'ERROR xvda-uuid not found %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'xvda-uuid not found')
             # next vm
             continue
         if xvda_name_label == '':
@@ -202,6 +219,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'ERROR xvda-name-label not found %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'xvda-name-label not found')
             # next vm
             continue
 
@@ -212,8 +230,10 @@ def main(session):
         cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
         if run_log_out_wait_rc(cmd) == 0:
             log ('vm is running')
+            vm_report['power_state'] = 'running'
         else:
             log ('vm is NOT running')
+            vm_report['power_state'] = 'halted'
 
         # list the vdi we will backup
         cmd = '%s/xe vdi-list uuid=%s' % (xe_path, xvda_uuid)
@@ -223,6 +243,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'VDI-LIST-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'VDI-LIST-FAIL')
             # next vm
             continue
 
@@ -257,6 +278,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'VDI-SNAPSHOT-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'VDI-SNAPSHOT-FAIL')
             # next vm
             continue
 
@@ -268,6 +290,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'VDI-PARAM-SET-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'VDI-PARAM-SET-FAIL')
             # next vm
             continue
 
@@ -283,6 +306,7 @@ def main(session):
             if config_specified:
                 status_log_vdi_export_end(server_name, 'VDI-EXPORT-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'VDI-EXPORT-FAIL')
             # next vm
             continue
 
@@ -299,31 +323,39 @@ def main(session):
         # ---------------------------------------
 
         elapseTime = datetime.datetime.now() - beginTime
-        backup_file_size = os.path.getsize(full_path_backup_file) / (1024 * 1024 * 1024)
+        backup_file_bytes = os.path.getsize(full_path_backup_file)
+        backup_file_size = backup_file_bytes // (1024 * 1024 * 1024)
         final_cleanup( full_path_backup_file, backup_file_size, full_backup_dir, vm_backup_dir, vm_max_backups)
 
         if not check_all_backups_success(vm_backup_dir):
             log('WARNING cleanup needed - not all backup history is successful')
             this_status = 'warning'
 
+        vm_report['file'] = full_path_backup_file
+        vm_report['size_bytes'] = backup_file_bytes
+        vm_report['copies'] = count_successful_backups(vm_backup_dir)
+        elapse_min = elapseTime.seconds // 60
         if (this_status == 'success'):
             success_cnt += 1
-            log('VmBackup vdi-export %s - ***Success*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vdi-export %s - ***Success*** t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vdi_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vdi_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'success', 'SUCCESS')
 
         elif (this_status == 'warning'):
             warning_cnt += 1
-            log('VmBackup vdi-export %s - ***WARNING*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vdi-export %s - ***WARNING*** t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vdi_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vdi_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'warning', 'WARNING')
 
         else:
             # this should never occur since all errors do a continue on to the next vm_name
             error_cnt += 1
-            log('VmBackup vdi-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vdi-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vdi_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vdi_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'error', 'ERROR-INTERNAL')
 
     # end of for vm_parm in config['vdi-export']:
     ######################################################################
@@ -341,6 +373,7 @@ def main(session):
         vm_name = get_vm_name(vm_parm)
         vm_max_backups = get_vm_max_backups(vm_parm)
         log('vm-export - vm_name: %s max_backups: %s' % (vm_name, vm_max_backups))
+        vm_report = report_vm_begin(vm_name, 'vm-export', vm_max_backups, beginTime)
 
         if config_specified:
             status_log_vm_export_begin(server_name, '%s' % vm_name)
@@ -351,6 +384,7 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'ERROR verify_vm_name %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'verify_vm_name')
             # next vm
             continue
 
@@ -371,8 +405,10 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'ERROR vm-uuid not found %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'vm-uuid not found')
             # next vm
             continue
+        vm_report['uuid'] = vm_uuid
 
         # ----------------------------------------
         # --- begin vm-export command sequence ---
@@ -381,8 +417,10 @@ def main(session):
         cmd = '%s/xe vm-list name-label="%s" params=power-state | /bin/grep running' % (xe_path, vm_name)
         if run_log_out_wait_rc(cmd) == 0:
             log ('vm is running')
+            vm_report['power_state'] = 'running'
         else:
             log ('vm is NOT running')
+            vm_report['power_state'] = 'halted'
 
         # check for old vm-snapshot for this vm
         snap_name = 'RESTORE_%s' % vm_name
@@ -402,8 +440,6 @@ def main(session):
                 # non-fatal - finsh processing for this vm
 
         # === pre_cleanup code goes in here ===
-        #print 'vm_backup_dir: %s' % vm_backup_dir
-        #print 'vm_max_backups: %s' % vm_max_backups
         if pre_clean:
            pre_cleanup (vm_backup_dir, vm_max_backups)
 
@@ -417,6 +453,7 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'SNAPSHOT-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'SNAPSHOT-FAIL')
             # next vm
             continue
 
@@ -428,54 +465,20 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'TEMPLATE-PARAM-SET-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'TEMPLATE-PARAM-SET-FAIL')
             # next vm
             continue
 
-        # exclude disk starting with [NOBAK]
-        cmd = '%s/xe vbd-list vm-uuid=%s params=uuid,vdi-name-label,vdi-uuid' % (xe_path, snap_vm_uuid)
-        log('2.5.cmd: %s' % cmd)
-        cmdoutput = run_log_out_wait_rc_ret_output(cmd)
-        vbds_to_delete = []
-        vdis_to_delete = []
-
-        for line in cmdoutput:
-            fields = line.split(':')
-            attrib = fields[0].strip()
-            value = fields[1].strip()
-            if attrib == 'uuid ( RO)':
-                current_vbd = value
-                continue
-            if attrib == 'vdi-uuid ( RO)':
-                current_vdi = value
-                continue
-            if attrib == 'vdi-name-label ( RO)':
-                if value.startswith('[NOBAK]'):
-                    vbds_to_delete.append(current_vbd)
-                    vdis_to_delete.append(current_vdi)
-            current_vbd = ''
-            current_vdi = ''
-
-        if len(vbds_to_delete) == 0:
-            log('no VBDs to exclude')
-        else:
-            log("deleting [NOBAK] VBDs and VDIs:")
-            for uuid in vbds_to_delete:
-                cmd = '%s/xe vbd-destroy uuid=%s' % (xe_path, uuid)
-                if run_log_out_wait_rc(cmd) == 0:
-                    log('SUCCESS %s' % cmd)
-                else:
-                    log('ERROR %s' % cmd)
-            for uuid in vdis_to_delete:
-                cmd = '%s/xe vdi-destroy uuid=%s' % (xe_path, uuid)
-                if run_log_out_wait_rc(cmd) == 0:
-                    log('SUCCESS %s' % cmd)
-                else:
-                    log('ERROR %s' % cmd)
-
+        # exclude disks whose VDI name-label starts with [NOBAK] (same convention as Xen Orchestra):
+        # the snapshot's VBD and VDI are destroyed before the export, the original VM is untouched.
+        vm_report['excluded_disks'] = exclude_nobak_disks(snap_vm_uuid)
 
         # vm-export vm-snapshot
         cmd = '%s/xe vm-export uuid=%s' % (xe_path, snap_vm_uuid)
-        if compress:
+        if compress == 'zstd':
+            full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva.zst')
+            cmd = '%s filename="%s" compress=zstd' % (cmd, full_path_backup_file)
+        elif compress == 'gzip':
             full_path_backup_file = os.path.join(full_backup_dir, vm_name + '.xva.gz')
             cmd = '%s filename="%s" compress=true' % (cmd, full_path_backup_file)
         else:
@@ -489,6 +492,7 @@ def main(session):
             if config_specified:
                 status_log_vm_export_end(server_name, 'VM-EXPORT-FAIL %s' % vm_name)
             error_cnt += 1
+            report_vm_end(vm_report, 'error', 'VM-EXPORT-FAIL')
             # next vm
             continue
 
@@ -505,31 +509,39 @@ def main(session):
         # ----------------------------------------
 
         elapseTime = datetime.datetime.now() - beginTime
-        backup_file_size = os.path.getsize(full_path_backup_file) / (1024 * 1024 * 1024)
+        backup_file_bytes = os.path.getsize(full_path_backup_file)
+        backup_file_size = backup_file_bytes // (1024 * 1024 * 1024)
         final_cleanup( full_path_backup_file, backup_file_size, full_backup_dir, vm_backup_dir, vm_max_backups)
 
         if not check_all_backups_success(vm_backup_dir):
             log('WARNING cleanup needed - not all backup history is successful')
             this_status = 'warning'
 
+        vm_report['file'] = full_path_backup_file
+        vm_report['size_bytes'] = backup_file_bytes
+        vm_report['copies'] = count_successful_backups(vm_backup_dir)
+        elapse_min = elapseTime.seconds // 60
         if (this_status == 'success'):
             success_cnt += 1
-            log('VmBackup vm-export %s - ***Success*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vm-export %s - ***Success*** t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vm_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vm_export_end(server_name, 'SUCCESS %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'success', 'SUCCESS')
 
         elif (this_status == 'warning'):
             warning_cnt += 1
-            log('VmBackup vm-export %s - ***WARNING*** t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vm-export %s - ***WARNING*** t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vm_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vm_export_end(server_name, 'WARNING %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'warning', 'WARNING')
 
         else:
             # this should never occur since all errors do a continue on to the next vm_name
             error_cnt += 1
-            log('VmBackup vm-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, str(elapseTime.seconds/60)))
+            log('VmBackup vm-export %s - +++ERROR-INTERNAL+++ t:%s' % (vm_name, elapse_min))
             if config_specified:
-                status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, str(elapseTime.seconds/60), backup_file_size))
+                status_log_vm_export_end(server_name, 'ERROR-INTERNAL %s,elapse:%s size:%sG' % (vm_name, elapse_min, backup_file_size))
+            report_vm_end(vm_report, 'error', 'ERROR-INTERNAL')
 
     # end of for vm_parm in config['vm-export']:
     ######################################################################
@@ -541,29 +553,280 @@ def main(session):
     summary = 'S:%s W:%s E:%s' % (success_cnt, warning_cnt, error_cnt)
     status_log = config['status_log']
     if (error_cnt > 0):
+        overall = 'error'
         if config_specified:
             status_log_end(server_name, 'ERROR,%s' % summary)
-            # MAIL_ENABLE: optional email may be enabled by uncommenting out the next two lines
-            #send_email(MAIL_TO_ADDR, 'ERROR ' + os.uname()[1] + ' VmBackup.py', status_log)
-            #open('%s' % status_log, 'w').close() # trunc status log after email
         log('VmBackup ended - **ERRORS DETECTED** - %s' % summary)
     elif (warning_cnt > 0):
+        overall = 'warning'
         if config_specified:
             status_log_end(server_name, 'WARNING,%s' % summary)
-            # MAIL_ENABLE: optional email may be enabled by uncommenting out the next two lines
-            #send_email(MAIL_TO_ADDR,'WARNING ' + os.uname()[1] + ' VmBackup.py', status_log)
-            #open('%s' % status_log, 'w').close() # trunc status log after email
         log('VmBackup ended - **WARNING(s)** - %s' % summary)
     else:
+        overall = 'success'
         if config_specified:
             status_log_end(server_name, 'SUCCESS,%s' % summary)
-            # MAIL_ENABLE: optional email may be enabled by uncommenting out the next two lines
-            #send_email(MAIL_TO_ADDR, 'Success ' + os.uname()[1] + ' VmBackup.py', status_log)
-            #open('%s' % status_log, 'w').close() # trunc status log after email
         log('VmBackup ended - Success - %s' % summary)
+
+    # report to the itsdave backup API (schema naubackup-v1) and by mail; neither may change the result
+    run_end = datetime.datetime.now()
+    try:
+        report_finish(server_name, run_begin, run_end, overall, success_cnt, warning_cnt, error_cnt)
+    except Exception as e:
+        log('WARNING report could not be built or sent: %s' % e)
+
+    if mail_wanted(overall):
+        subject = {'error': 'ERROR', 'warning': 'WARNING', 'success': 'Success'}[overall]
+        send_email(mail_setting('mail_to', MAIL_TO_ADDR), '%s %s VmBackup.py' % (subject, os.uname()[1]), status_log)
+        if config_specified:
+            open('%s' % status_log, 'w').close() # trunc status log after email
+
+    return {'error': 2, 'warning': 1, 'success': 0}[overall]
 
     # done with main()
     ######################################################################
+
+############################# report (naubackup-v1)
+
+def report_vm_begin(vm_name, mode, vm_max_backups, begin_time):
+    entry = {
+        'name': vm_name,
+        'mode': mode,
+        'max_backups': vm_max_backups,
+        'started_at': begin_time.isoformat(timespec='seconds'),
+        'ended_at': None,
+        'duration_sec': None,
+        'status': 'running',
+        'message': '',
+        'file': None,
+        'size_bytes': None,
+        'copies': None,
+    }
+    report['vms'].append(entry)
+    return entry
+
+def report_vm_end(entry, status, text):
+    end = datetime.datetime.now()
+    entry['status'] = status
+    entry['message'] = text
+    entry['ended_at'] = end.isoformat(timespec='seconds')
+    try:
+        begin = datetime.datetime.strptime(entry['started_at'], '%Y-%m-%dT%H:%M:%S')
+        entry['duration_sec'] = int((end - begin).total_seconds())
+    except ValueError:
+        entry['duration_sec'] = None
+
+def count_successful_backups(path):
+    # how many restorable copies the target holds for this VM
+    try:
+        dirs = os.listdir(path)
+    except OSError:
+        return None
+    cnt = 0
+    for d in dirs:
+        for marker in ('success', 'success_restore', 'success_compress', 'success_compressing'):
+            if os.path.exists(os.path.join(path, d, marker)):
+                cnt += 1
+                break
+    return cnt
+
+def target_info(path):
+    info = {'backup_dir': path}
+    try:
+        st = os.statvfs(path)
+        size = st.f_blocks * st.f_frsize
+        avail = st.f_bavail * st.f_frsize
+        used = size - st.f_bfree * st.f_frsize
+        info.update({'size_bytes': size, 'used_bytes': used, 'avail_bytes': avail,
+                     'used_pct': round(used * 100.0 / size, 1) if size else None})
+    except OSError as e:
+        info['error'] = str(e)
+    # device / filesystem from df
+    try:
+        out = subprocess.check_output(['/bin/df', '-T', path], universal_newlines=True, stderr=subprocess.STDOUT).splitlines()
+        if len(out) >= 2:
+            fields = out[1].split()
+            info['device'] = fields[0]
+            info['fstype'] = fields[1]
+            info['mountpoint'] = fields[-1]
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    # target_state written by runBackup.sh (removable disk identity), if present
+    state_file = os.path.join(os.path.dirname(os.path.abspath(config['status_log'])), 'target_state')
+    if os.path.exists(state_file):
+        state = {}
+        with open(state_file) as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.rstrip('\n').split('=', 1)
+                    state[k.strip()] = v.strip()
+        info['target_state'] = state
+    return info
+
+def host_info(server_name):
+    info = {'name': server_name, 'fqdn': os.uname()[1], 'product': None, 'version': None, 'pool_master': None}
+    try:
+        with open('/etc/xensource-inventory') as f:
+            for line in f:
+                if line.startswith('PRODUCT_BRAND='):
+                    info['product'] = line.split('=', 1)[1].strip().strip("'")
+                if line.startswith('PRODUCT_VERSION='):
+                    info['version'] = line.split('=', 1)[1].strip().strip("'")
+    except OSError:
+        pass
+    try:
+        info['pool_master'] = is_xe_master()
+    except Exception:
+        pass
+    return info
+
+def report_finish(server_name, run_begin, run_end, overall, success_cnt, warning_cnt, error_cnt):
+    data = {
+        'schema': REPORT_SCHEMA,
+        'backup_type': REPORT_SCHEMA,
+        'generator': 'VmBackup.py %s' % VERSION,
+        'host': host_info(server_name),
+        'run': {
+            'started_at': run_begin.isoformat(timespec='seconds'),
+            'ended_at': run_end.isoformat(timespec='seconds'),
+            'duration_sec': int((run_end - run_begin).total_seconds()),
+            'status': overall,
+            'success_count': success_cnt,
+            'warning_count': warning_cnt,
+            'error_count': error_cnt,
+            'config_file': cfg_file if config_specified else None,
+            'compress': compress,
+            'vm_count_configured': len(config['vm-export']) + len(config['vdi-export']),
+        },
+        'target': target_info(config['backup_dir']),
+        'pool_metadata': report['pool_metadata'],
+        'vms': report['vms'],
+    }
+    report_file = os.path.join(os.path.dirname(os.path.abspath(config['status_log'])), 'last_report.json')
+    try:
+        with open(report_file, 'w') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        log('report written: %s' % report_file)
+    except OSError as e:
+        log('WARNING could not write %s: %s' % (report_file, e))
+
+    if not api_report_wanted():
+        return
+    token = secrets.get('api_token', '')
+    if not token:
+        log('WARNING api_report requested but no api_token in secrets file %s' % secrets_file)
+        return
+    api_url = (config_value('api_url') or DEFAULT_API_URL).rstrip('/')
+    hostname = config_value('api_hostname') or os.uname()[1]
+    ok, answer = post_report(api_url + '/backup', token, hostname, data)
+    if ok:
+        log('report sent to %s as %s: %s' % (api_url, hostname, answer[:200]))
+    else:
+        log('WARNING report NOT sent to %s: %s' % (api_url, answer[:300]))
+
+def api_report_wanted():
+    value = config_value('api_report').lower()
+    if value in ('false', 'no', '0', 'off'):
+        return False
+    if value in ('true', 'yes', '1', 'on'):
+        return True
+    # default: report when a token is configured
+    return bool(secrets.get('api_token'))
+
+def post_report(url, token, hostname, data):
+    # multipart/form-data: hostname, backup_type, backuplog (JSON file) - the format the itsdave backup API expects
+    boundary = '----NAUbackup%s' % uuidlib.uuid4().hex[:16]
+    body_json = json.dumps(data, indent=2, sort_keys=True).encode('utf-8')
+    parts = []
+    parts.append(('--%s' % boundary).encode())
+    parts.append(b'Content-Disposition: form-data; name="hostname"')
+    parts.append(b'')
+    parts.append(hostname.encode('utf-8'))
+    parts.append(('--%s' % boundary).encode())
+    parts.append(b'Content-Disposition: form-data; name="backup_type"')
+    parts.append(b'')
+    parts.append(REPORT_SCHEMA.encode())
+    parts.append(('--%s' % boundary).encode())
+    parts.append(b'Content-Disposition: form-data; name="backuplog"; filename="naubackup-report.json"')
+    parts.append(b'Content-Type: application/json')
+    parts.append(b'')
+    parts.append(body_json)
+    parts.append(('--%s--' % boundary).encode())
+    parts.append(b'')
+    body = b'\r\n'.join(parts)
+    headers = {'Content-Type': 'multipart/form-data; boundary=%s' % boundary,
+               'Authorization': 'Bearer %s' % token,
+               'User-Agent': 'VmBackup.py %s' % VERSION}
+    last = ''
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                answer = resp.read().decode('utf-8', 'replace')
+                if resp.status in (200, 201):
+                    return True, answer
+                last = 'HTTP %s: %s' % (resp.status, answer)
+        except urllib.error.HTTPError as e:
+            last = 'HTTP %s: %s' % (e.code, e.read().decode('utf-8', 'replace')[:200])
+            if 400 <= e.code < 500:
+                break  # not going to get better by retrying
+        except (urllib.error.URLError, socket.error) as e:
+            last = str(e)
+        time.sleep(5)
+    return False, last
+
+############################# [NOBAK]
+
+def exclude_nobak_disks(snap_vm_uuid):
+    cmd = '%s/xe vbd-list vm-uuid=%s params=uuid,vdi-name-label,vdi-uuid' % (xe_path, snap_vm_uuid)
+    log('2.5.cmd: %s' % cmd)
+    cmdoutput = run_log_out_wait_rc_ret_output(cmd)
+    vbds_to_delete = []
+    vdis_to_delete = []
+    excluded = []
+    current_vbd = ''
+    current_vdi = ''
+
+    for line in cmdoutput:
+        fields = line.split(':', 1)
+        if len(fields) < 2:
+            continue
+        attrib = fields[0].strip()
+        value = fields[1].strip()
+        if attrib == 'uuid ( RO)':
+            current_vbd = value
+            continue
+        if attrib == 'vdi-uuid ( RO)':
+            current_vdi = value
+            continue
+        if attrib == 'vdi-name-label ( RO)':
+            if value.startswith('[NOBAK]'):
+                vbds_to_delete.append(current_vbd)
+                vdis_to_delete.append(current_vdi)
+                excluded.append(value)
+        current_vbd = ''
+        current_vdi = ''
+
+    if len(vbds_to_delete) == 0:
+        log('no VBDs to exclude')
+    else:
+        log("deleting [NOBAK] VBDs and VDIs from the snapshot:")
+        for uuid in vbds_to_delete:
+            cmd = '%s/xe vbd-destroy uuid=%s' % (xe_path, uuid)
+            if run_log_out_wait_rc(cmd) == 0:
+                log('SUCCESS %s' % cmd)
+            else:
+                log('ERROR %s' % cmd)
+        for uuid in vdis_to_delete:
+            cmd = '%s/xe vdi-destroy uuid=%s' % (xe_path, uuid)
+            if run_log_out_wait_rc(cmd) == 0:
+                log('SUCCESS %s' % cmd)
+            else:
+                log('ERROR %s' % cmd)
+    return excluded
+
+############################# helpers (upstream)
+
 def isInt(s):
     try:
         int(s)
@@ -592,7 +855,7 @@ def is_vm_backups_valid(vm_parm):
         # a value has been specified - is it valid?
         (vm_name,tmp_max_backups) = vm_parm.split(':')
         if isInt(tmp_max_backups):
-            return tmp_max_backups > 0
+            return int(tmp_max_backups) > 0
         else:
             return False
 
@@ -630,7 +893,7 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
     vm_uuid = ''
     xvda_uuid = ''
     xvda_name_label = ''
-    tmp_error = '';
+    tmp_error = ''
 
     vm_record = session.xenapi.VM.get_record(vm_object)
     vm_uuid = vm_record['uuid']
@@ -639,38 +902,10 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
     cmd = '%s/xe vm-export metadata=true uuid=%s filename= | tar -xOf - | /usr/bin/xmllint -format - > "%s/vm-metadata.xml"' % (xe_path, vm_uuid, tmp_full_backup_dir)
     if run_log_out_wait_rc(cmd) != 0:
         log('WARNING %s' % cmd)
-        this_status = 'warning'
         # non-fatal - finish processing for this vm
 
     log ('*** vm-export metadata end')
 
-### The backup of the VM metadata portion in the code section below is
-### deprecated since some entries such as name_label can contain
-### non-standard characters that result in errors. All metadata are now saved
-### using the code above. The additional VIF, Disk, VDI and VBD outputs
-### are retained for now.
-
-#    # Backup vm meta data
-#    log ('Writing vm config file.')
-#    vm_out = open ('%s/vm.cfg' % tmp_full_backup_dir, 'w')
-#    vm_out.write('name_label=%s\n' % vm_record['name_label'])
-#    vm_out.write('name_description=%s\n' % vm_record['name_description'])
-#    vm_out.write('memory_dynamic_max=%s\n' % vm_record['memory_dynamic_max'])
-#    vm_out.write('VCPUs_max=%s\n' % vm_record['VCPUs_max'])
-#    vm_out.write('VCPUs_at_startup=%s\n' % vm_record['VCPUs_at_startup'])
-#    # notice some keys are not always available
-#    try:
-#        # notice list within list : vm_record['other_config']['base_template_name']
-#        vm_out.write('base_template_name=%s\n' % vm_record['other_config']['base_template_name'])
-#    except KeyError:
-#        # ignore
-#        pass
-#    vm_out.write('os_version=%s\n' % get_os_version(vm_record['uuid']))
-#    # get orig uuid for special metadata disaster recovery
-#    vm_out.write('orig_uuid=%s\n' % vm_record['uuid'])
-#    vm_uuid = vm_record['uuid']
-#    vm_out.close()
-#
     # Write metadata files for vdis and vbds.  These end up inside of a DISK- directory.
     log ('Writing disk info')
     vbd_cnt = 0
@@ -696,34 +931,30 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
         # now write out the vbd info.
         device_path = '%s/DISK-%s' % (tmp_full_backup_dir,  vbd_record_device)
         os.mkdir(device_path)
-        vbd_out = open('%s/vbd.cfg' % device_path, 'w')
-        vbd_out.write('userdevice=%s\n' % vbd_record['userdevice'])
-        vbd_out.write('bootable=%s\n' % vbd_record['bootable'])
-        vbd_out.write('mode=%s\n' % vbd_record['mode'])
-        vbd_out.write('type=%s\n' % vbd_record['type'])
-        vbd_out.write('unpluggable=%s\n' % vbd_record['unpluggable'])
-        vbd_out.write('empty=%s\n' % vbd_record['empty'])
-        # get orig uuid for special metadata disaster recovery
-        vbd_out.write('orig_uuid=%s\n' % vbd_record['uuid'])
-        # other_config and qos stuff is not backed up
-        vbd_out.close()
+        with open('%s/vbd.cfg' % device_path, 'w') as vbd_out:
+            vbd_out.write('userdevice=%s\n' % vbd_record['userdevice'])
+            vbd_out.write('bootable=%s\n' % vbd_record['bootable'])
+            vbd_out.write('mode=%s\n' % vbd_record['mode'])
+            vbd_out.write('type=%s\n' % vbd_record['type'])
+            vbd_out.write('unpluggable=%s\n' % vbd_record['unpluggable'])
+            vbd_out.write('empty=%s\n' % vbd_record['empty'])
+            # get orig uuid for special metadata disaster recovery
+            vbd_out.write('orig_uuid=%s\n' % vbd_record['uuid'])
+            # other_config and qos stuff is not backed up
 
         # now write out the vdi info.
-        vdi_out = open('%s/vdi.cfg' % device_path, 'w')
-        #vdi_out.write('name_label=%s\n' % vdi_record['name_label'])
-        vdi_out.write('name_label=%s\n' % (vdi_record['name_label']).encode("utf-8"))
-        # vdi_out.write('name_description=%s\n' % vdi_record['name_description'])
-        vdi_out.write('name_description=%s\n' % (vdi_record['name_description']).encode("utf-8"))
-        vdi_out.write('virtual_size=%s\n' % vdi_record['virtual_size'])
-        vdi_out.write('type=%s\n' % vdi_record['type'])
-        vdi_out.write('sharable=%s\n' % vdi_record['sharable'])
-        vdi_out.write('read_only=%s\n' % vdi_record['read_only'])
-        # get orig uuid for special metadata disaster recovery
-        vdi_out.write('orig_uuid=%s\n' % vdi_record['uuid'])
-        sr_uuid = session.xenapi.SR.get_record(vdi_record['SR'])['uuid']
-        vdi_out.write('orig_sr_uuid=%s\n' % sr_uuid)
-        # other_config and qos stuff is not backed up
-        vdi_out.close()
+        with open('%s/vdi.cfg' % device_path, 'w') as vdi_out:
+            vdi_out.write('name_label=%s\n' % vdi_record['name_label'])
+            vdi_out.write('name_description=%s\n' % vdi_record['name_description'])
+            vdi_out.write('virtual_size=%s\n' % vdi_record['virtual_size'])
+            vdi_out.write('type=%s\n' % vdi_record['type'])
+            vdi_out.write('sharable=%s\n' % vdi_record['sharable'])
+            vdi_out.write('read_only=%s\n' % vdi_record['read_only'])
+            # get orig uuid for special metadata disaster recovery
+            vdi_out.write('orig_uuid=%s\n' % vdi_record['uuid'])
+            sr_uuid = session.xenapi.SR.get_record(vdi_record['SR'])['uuid']
+            vdi_out.write('orig_sr_uuid=%s\n' % sr_uuid)
+            # other_config and qos stuff is not backed up
         if vbd_record_device == 'xvda':
             xvda_uuid = vdi_record['uuid']
             xvda_name_label = vdi_record['name_label']
@@ -736,15 +967,14 @@ def gather_vm_meta(vm_object, tmp_full_backup_dir):
         device_path = '%s/VIFs' % tmp_full_backup_dir
         if (not os.path.exists(device_path)):
             os.mkdir(device_path)
-        vif_out = open('%s/vif-%s.cfg' % (device_path, vif_record['device']), 'w')
-        vif_out.write('device=%s\n' % vif_record['device'])
-        network_name = session.xenapi.network.get_record(vif_record['network'])['name_label']
-        vif_out.write('network_name_label=%s\n' % network_name)
-        vif_out.write('MTU=%s\n' % vif_record['MTU'])
-        vif_out.write('MAC=%s\n' % vif_record['MAC'])
-        vif_out.write('other_config=%s\n' % vif_record['other_config'])
-        vif_out.write('orig_uuid=%s\n' % vif_record['uuid'])
-        vif_out.close()
+        with open('%s/vif-%s.cfg' % (device_path, vif_record['device']), 'w') as vif_out:
+            vif_out.write('device=%s\n' % vif_record['device'])
+            network_name = session.xenapi.network.get_record(vif_record['network'])['name_label']
+            vif_out.write('network_name_label=%s\n' % network_name)
+            vif_out.write('MTU=%s\n' % vif_record['MTU'])
+            vif_out.write('MAC=%s\n' % vif_record['MAC'])
+            vif_out.write('other_config=%s\n' % vif_record['other_config'])
+            vif_out.write('orig_uuid=%s\n' % vif_record['uuid'])
 
     return tmp_error
 
@@ -768,12 +998,7 @@ def final_cleanup( tmp_full_path_backup_file, tmp_backup_file_size, tmp_full_bac
         shutil.rmtree(tmp_vm_backup_dir + '/' + dir_to_remove)
         dir_to_remove = get_dir_to_remove(tmp_vm_backup_dir, tmp_vm_max_backups)
 
-####  need to just feed in directory and find oldest named subdirectory
-### def pre_cleanup( tmp_full_path_backup_file, tmp_full_backup_dir, tmp_vm_backup_dir, tmp_vm_max_backups):
 def pre_cleanup(tmp_vm_backup_dir, tmp_vm_max_backups):
-  #print ' ==== tmp_full_backup_dir: %s' % tmp_full_backup_dir
-  #print ' ==== tmp_vm_backup_dir: %s' % tmp_vm_backup_dir
-  #print ' ==== tmp_vm_max_backups: %d' % tmp_vm_max_backups
   log('success identifying directory : %s ' % tmp_vm_backup_dir)
   # Remove oldest if more than tmp_vm_max_backups -1
   pre_vm_max_backups = tmp_vm_max_backups - 1
@@ -799,7 +1024,6 @@ def process_backup_dir(tmp_vm_backup_dir):
     log ('Check for last **unsuccessful** backup: %s' % tmp_vm_backup_dir)
     dir_not_success = get_last_backup_dir_that_failed(tmp_vm_backup_dir)
     if (dir_not_success):
-        #if (not os.path.exists(tmp_vm_backup_dir + '/' + dir_not_success + '/fail')):
         log ('Delete last **unsuccessful** backup %s/%s ' % (tmp_vm_backup_dir, dir_not_success))
         # remove last unseccessful backup  - if throw exception then stop processing
         shutil.rmtree(tmp_vm_backup_dir + '/' + dir_not_success)
@@ -832,8 +1056,8 @@ def get_meta_path(base_path):
         # Create new dir
         try:
             os.mkdir(base_path)
-        except OSError, error:
-            log('ERROR creating directory %s : %s' % (base_path, error.as_string()))
+        except OSError as error:
+            log('ERROR creating directory %s : %s' % (base_path, error))
             return False
 
     date = datetime.datetime.today()
@@ -858,7 +1082,6 @@ def get_last_backup_dir_that_failed(path):
         return False
     dirs.sort()
     # note: dirs[-1] is the last entry
-    #print "==== dirs that failed: %s" % dirs
     if (not os.path.exists(path + '/' + dirs[-1] + '/success')) and \
         (not os.path.exists(path + '/' + dirs[-1] + '/success_restore')) and \
         (not os.path.exists(path + '/' + dirs[-1] + '/success_compress' )) and \
@@ -890,6 +1113,8 @@ def backup_pool_metadata(svr_name):
 
     metadata_base = os.path.join(config['backup_dir'], 'METADATA_' + svr_name)
     metadata_file = get_meta_path(metadata_base)
+    if not metadata_file:
+        return False
 
     cmd = "%s/xe pool-dump-database file-name='%s'" % (xe_path, metadata_file)
     log(cmd)
@@ -905,7 +1130,7 @@ def backup_pool_metadata(svr_name):
 #  xe pool-dump-database file-name=<dup-file-already-exists>
 #     -> error .returncode=1 w/ error msg
 def run_log_out_wait_rc(cmd, log_w_timestamp=True):
-    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, universal_newlines=True)
     line = child.stdout.readline()
     while line:
         log(line.rstrip("\n"), log_w_timestamp)
@@ -913,7 +1138,7 @@ def run_log_out_wait_rc(cmd, log_w_timestamp=True):
     return child.wait()
 
 def run_log_out_wait_rc_ret_output(cmd, log_w_timestamp=True):
-    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, universal_newlines=True)
     line = child.stdout.readline()
     output = []
     while line:
@@ -922,6 +1147,7 @@ def run_log_out_wait_rc_ret_output(cmd, log_w_timestamp=True):
             log(line.rstrip("\n"), log_w_timestamp)
             output.append(linestring)
         line = child.stdout.readline()
+    child.wait()
     return output
 
 def run_get_lastline(cmd):
@@ -931,6 +1157,7 @@ def run_get_lastline(cmd):
     resp = ''
     for line in f.readlines():
         resp = line.rstrip("\n")
+    f.close()
     return resp
 
 def get_os_version(uuid):
@@ -943,55 +1170,104 @@ def df_snapshots(log_msg):
     for line in f.readlines():
         line = line.rstrip("\n")
         log(line)
+    f.close()
+
+############################# mail
+
+def config_value(key, default=''):
+    # scalar config value; a key given twice in the file ends up as a list, the last one wins
+    value = config.get(key, '')
+    if isinstance(value, list):
+        value = value[-1]
+    return str(value).strip() or default
+
+def mail_setting(key, legacy_default=''):
+    return config_value(key, legacy_default)
+
+def mail_wanted(overall):
+    to = mail_setting('mail_to', MAIL_TO_ADDR)
+    if not to:
+        return False
+    mode = (mail_setting('mail_mode') or DEFAULT_MAIL_MODE).lower()
+    if mode == 'never':
+        return False
+    if mode == 'problems':
+        return overall != 'success'
+    return True
 
 def send_email(to, subject, body_fname):
 
     smtp_send_retries = 3
     smtp_send_attempt = 0
 
-    message = open('%s' % body_fname, 'r').read()
+    try:
+        with open('%s' % body_fname, 'r') as f:
+            body = f.read()
+    except OSError:
+        body = message
 
-    msg = MIMEText(message)
+    msg = MIMEText(body)
     msg['subject'] = subject
-    msg['From'] = MAIL_FROM_ADDR
+    mail_from = mail_setting('mail_from', MAIL_FROM_ADDR)
+    server = mail_setting('mail_smtp_server', MAIL_SMTP_SERVER)
+    port = int(mail_setting('mail_smtp_port') or DEFAULT_MAIL_SMTP_PORT)
+    username = secrets.get('mailuser', '')
+    password = secrets.get('mailpass', '')
+    msg['From'] = mail_from
     msg['To'] = to
 
     while smtp_send_attempt < smtp_send_retries:
         smtp_send_attempt += 1
-        if smtp_send_attempt > smtp_send_retries:
-            print("Send email count limit exceeded")
-            sys.exit(1)
         try:
-            # note if using an ipaddress in MAIL_SMTP_SERVER,
-            # then may require smtplib.SMTP(MAIL_SMTP_SERVER, local_hostname="localhost")
-
-            ## Optional use of SMTP user authentication via TLS
-            ##
-            ## If so, comment out the next line of code and uncomment/configure
-            ## the next block of code. Note that different SMTP servers will require
-            ## different username options, such as the plain username, the
-            ## domain\username, etc. The "From" email address entry must be a valid
-            ## email address that can be authenticated  and should be configured
-            ## in the MAIL_FROM_ADDR variable along with MAIL_SMTP_SERVER early in
-            ## the script. Note that some SMTP servers might use port 465 instead of 587.
-            s = smtplib.SMTP(MAIL_SMTP_SERVER)
-            #### start block
-            #username = 'MyLogin'
-            #password = 'MyPassword'
-            #s = smtplib.SMTP(MAIL_SMTP_SERVER, 587)
-            #s.ehlo()
-            #s.starttls()
-            #s.login(username, password)
-            #### end block
-            s.sendmail(MAIL_FROM_ADDR, to.split(','), msg.as_string())
+            # note if using an ipaddress for the server,
+            # then may require smtplib.SMTP(server, local_hostname="localhost")
+            if port == 465:
+                s = smtplib.SMTP_SSL(server, port, timeout=60)
+            else:
+                s = smtplib.SMTP(server, port, timeout=60)
+                s.ehlo()
+                if port != 25 or s.has_extn('STARTTLS'):
+                    s.starttls()
+                    s.ehlo()
+            if username:
+                s.login(username, password)
+            s.sendmail(mail_from, to.split(','), msg.as_string())
             s.quit()
+            log('mail sent to %s via %s:%s' % (to, server, port))
             break
-        except socket.error, e:
-            print("Exception: socket.error -  %s" %e)
+        except socket.error as e:
+            print("Exception: socket.error -  %s" % e, flush=True)
             time.sleep(5)
-        except smtplib.SMTPException, e:
-            print("Exception: SMTPException - %s" %e.message)
+        except smtplib.SMTPException as e:
+            print("Exception: SMTPException - %s" % e, flush=True)
             time.sleep(5)
+    else:
+        log('WARNING mail could not be sent after %s attempts' % smtp_send_retries)
+
+############################# secrets
+
+def load_secrets(path):
+    # key=value lines, chmod 600; keys used here: mailuser, mailpass, api_token
+    # (lukspass is read by runBackup.sh, not by this script)
+    loaded = {}
+    if not path or not os.path.exists(path):
+        return loaded
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            print('WARNING %s is readable by others (mode %o), expected 600' % (path, mode), flush=True)
+        with open(path) as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                loaded[k.strip()] = v.strip()
+    except OSError as e:
+        print('WARNING cannot read secrets file %s: %s' % (path, e), flush=True)
+    return loaded
+
+############################# config
 
 def is_xe_master():
     # test to see if we are running on xe master
@@ -1002,6 +1278,10 @@ def is_xe_master():
     hostname = os.uname()[1]
     cmd = '%s/xe host-list name-label=%s --minimal' % (xe_path, hostname)
     host_uuid = run_get_lastline(cmd)
+    if host_uuid == '':
+        # the host name-label may differ from the hostname (XCP-ng sets it independently)
+        cmd = '%s/xe host-list hostname=%s --minimal' % (xe_path, hostname)
+        host_uuid = run_get_lastline(cmd)
 
     if host_uuid == master_uuid:
         return True
@@ -1011,66 +1291,75 @@ def is_xe_master():
 def is_config_valid():
 
     if not isInt(config['pool_db_backup']):
-        print 'ERROR: config pool_db_backup non-numeric -> %s' % config['pool_db_backup']
+        print('ERROR: config pool_db_backup non-numeric -> %s' % config['pool_db_backup'])
         return False
 
     if int(config['pool_db_backup']) != 0 and int(config['pool_db_backup']) != 1:
-        print 'ERROR: config pool_db_backup out of range -> %s' % config['pool_db_backup']
+        print('ERROR: config pool_db_backup out of range -> %s' % config['pool_db_backup'])
         return False
 
     if not isInt(config['max_backups']):
-        print 'ERROR: config max_backups non-numeric -> %s' % config['max_backups']
+        print('ERROR: config max_backups non-numeric -> %s' % config['max_backups'])
         return False
 
     if int(config['max_backups']) < 1:
-        print 'ERROR: config max_backups out of range -> %s' % config['max_backups']
+        print('ERROR: config max_backups out of range -> %s' % config['max_backups'])
         return False
 
     if config['vdi_export_format'] != 'raw' and config['vdi_export_format'] != 'vhd':
-        print 'ERROR: config vdi_export_format invalid -> %s' % config['vdi_export_format']
+        print('ERROR: config vdi_export_format invalid -> %s' % config['vdi_export_format'])
         return False
 
     if not os.path.exists(config['backup_dir']):
-        print 'ERROR: config backup_dir does not exist -> %s' % config['backup_dir']
+        print('ERROR: config backup_dir does not exist -> %s' % config['backup_dir'])
+        return False
+
+    if compress not in ('none', 'gzip', 'zstd'):
+        print('ERROR: compress must be none, gzip or zstd -> %s' % compress)
+        return False
+
+    mode = (mail_setting('mail_mode') or DEFAULT_MAIL_MODE).lower()
+    if mode not in ('always', 'problems', 'never'):
+        print('ERROR: mail_mode must be always, problems or never -> %s' % mode)
         return False
 
     tmp_return = True
     for vm_parm in config['vdi-export']:
         if not is_vm_backups_valid(vm_parm):
-            print 'ERROR: vm_max_backup is invalid - %s' % vm_parm
+            print('ERROR: vm_max_backup is invalid - %s' % vm_parm)
             tmp_return = False
 
     for vm_parm in config['vm-export']:
         if not is_vm_backups_valid(vm_parm):
-            print 'ERROR: vm_max_backup is invalid - %s' % vm_parm
+            print('ERROR: vm_max_backup is invalid - %s' % vm_parm)
             tmp_return = False
 
     return tmp_return
 
 def config_load(path):
     return_value = True
-    config_file = open(path, 'r')
-    for line in config_file:
-        if (not line.startswith('#') and len(line.strip()) > 0):
-            (key,value) = line.strip().split('=')
-            key = key.strip()
-            value = value.strip()
+    with open(path, 'r') as config_file:
+        for line in config_file:
+            if (not line.startswith('#') and len(line.strip()) > 0):
+                (key,value) = line.strip().split('=', 1)
+                key = key.strip()
+                value = value.strip()
 
-            # check for valid keys
-            if not key in expected_keys:
-                if ignore_extra_keys:
-                    log('ignoring config key: %s' % key)
+                # check for valid keys
+                if not key in expected_keys:
+                    if ignore_extra_keys:
+                        log('ignoring config key: %s' % key)
+                    else:
+                        print('***ERROR unexpected config key: %s' % key)
+                        return_value = False
+
+                if key == 'exclude':
+                    save_to_config_exclude( key, value)
+                elif key in ['vm-export','vdi-export']:
+                    save_to_config_export( key, value)
                 else:
-                    print '***ERROR unexpected config key: %s' % key
-                    return_value = False
-
-            if key == 'exclude':
-                save_to_config_exclude( key, value)
-            elif key in ['vm-export','vdi-export']:
-                save_to_config_export( key, value)
-            else:
-                # all other key's
-                save_to_config_values( key, value)
+                    # all other key's
+                    save_to_config_values( key, value)
 
     return return_value
 
@@ -1088,11 +1377,6 @@ def save_to_config_exclude( key, vm_name):
         log("***ERROR - invalid regex: %s=%s" % (key, vm_name))
         error_regex = True
         return
-    #for vm in all_vms:
-    #    if ((isNormalVmName(vm_name) and vm_name == vm) or
-    #        (not isNormalVmName(vm_name) and re.match(vm_name, vm))):
-    #        found_match = True
-    #        config[key].append(vm)
     for vm in all_vms:
 
         if ((isNormalVmName(vm_name) and vm_name == vm) or
@@ -1107,9 +1391,8 @@ def save_to_config_exclude( key, vm_name):
         for vm in config[key]:
             try:
                all_vms.remove(vm)
-            except:
+            except ValueError:
                pass
-               #print "VM not found -- ignore"
 
 def save_to_config_export( key, value):
     # save key/value in config[]
@@ -1155,8 +1438,8 @@ def save_to_config_export( key, value):
         log("***WARNING - vm not found: %s=%s" % (key, value))
         warning_match = True
 
-def isNormalVmName( str ):
-    if re.match('^[\w\s\-\_]+$', str) is not None:
+def isNormalVmName( name ):
+    if re.match(r'^[\w\s\-\_]+$', name) is not None:
         # normal vm name such as 'PRD-test123'
         return True
     else:
@@ -1194,7 +1477,6 @@ def verify_config_vms_exist():
     # verify all VMs in exclude exist
     vm_exclude_errors = verify_exclude_vms_exist()
     if vm_exclude_errors != '':
-        #all_vms_exist = False
         log('***WARNING - vm(s) Exclude does not exist: %s' % vm_exclude_errors)
 
     return all_vms_exist
@@ -1265,7 +1547,7 @@ def cleanup_vmexport_vdiexport_dups():
     for vdi_parm in config['vdi-export']:
         # vdi_parm has form PRD-name or PRD-name:5
         tmp_vdi_parm = get_vm_name(vdi_parm)
-        for vm_parm in config['vm-export']:
+        for vm_parm in list(config['vm-export']):
             tmp_vm_parm = get_vm_name(vm_parm)
             if tmp_vm_parm == tmp_vdi_parm:
                 log('***WARNING vdi-export duplicate - removing vm-export=%s' % vm_parm)
@@ -1275,13 +1557,8 @@ def cleanup_vmexport_vdiexport_dups():
     config['vm-export']=RemoveDup(config['vm-export'])
 
 def RemoveDup(duplicate):
-  # OK, this access to excludes works, good! Can use internally then.
-  #print 'exclude list: %s ' % config['exclude']
-  #print 'exclude element 0: %s' % config['exclude'][0]
-  #print 'exclude element 1: %s' % config['exclude'][1]
   final_list=[]
   for val in duplicate:
-    ##print '===== val: %s' % val
 
     # check if version exists and if so, take account of extra versions
     # as well as if a numbered wildcarded version already exists!
@@ -1291,43 +1568,30 @@ def RemoveDup(duplicate):
     if (val.find(':')!=-1):
        # found version in new VM entry and need to expand
        (valroot,numb) = val.split(':')
-       ##print 'found version to check: %s %s' % (val, valroot)
        versioned=1
     else:
        versioned=0
        # set root to be the same
        valroot=val
-       ##print 'valroot set to be val if simple name: %s' % valroot
 
     # Need to replace old with new if found
     # Redo list and replace with new value
-    # Loop on index, starting with 0 and if root is the same,
-    # sub in new value; last index in array is len(array)-1 since len(array)
-    # is the number of elements in an array.
     alen=len(final_list)
     i=0
-    # # #
     while i < alen:
        if (final_list[i].find(':')!=-1):
          (finroot,fnumb)= final_list[i].split(':')
        else:
          finroot=final_list[i]
-         ##print 'index: val, valroot, final_list, finroot: %s %s %s %s %s ' % (i, val, valroot, final_list[i], finroot)
        if (valroot == finroot):
           #root matches, hence replace
-          ##print '*** Replacing final_list with val, i: %s %s %s' % (final_list[i], val, i)
           final_list[i]=val
 
           # check again if excluded
-          ##print 'check again if excluded ........'
           j=0
           elen=len(config['exclude'])
           while j < elen:
              eroot=config['exclude'][j]
-             ##print 'valroot:%s' % valroot
-             ##print 'eroot:%s' % eroot
-             ##print 'final_list[i]:%s' % final_list[i]
-             ##print 'val:%s' % val
              if (valroot == eroot):
                 # remove from list
                 log ('***WARNING - forcing exclude of: %s ' % final_list[i])
@@ -1339,28 +1603,20 @@ def RemoveDup(duplicate):
 
           # VM has been accounted for
           accounted=1
-          ##print 'VM (val) has been accounted for, accounted: %s %s' % (val, accounted)
           break
        else:
           i=i+1
 
     # need to check plain case if not accounted for yet
-    ##print 'Not found anywhere else... accounted=%s' % accounted
     # However, check again if excluded and if so, do not add to list
-    ##print 'check YET again if excluded !!!!!!!!'
     j=0
     elen=len(config['exclude'])
     while j < elen:
        eroot=config['exclude'][j]
-       ##print 'valroot:%s' % valroot
-       ##print 'eroot:%s' % eroot
-       ###print 'final_list[i]:%s' % final_list[i]
-       ##print 'val:%s' % val
        if (valroot == eroot):
           # prevent from being added back onto the list
           log ('***WARNING - forcing exclude of: %s ' % val)
           accounted=1
-          ##print '=== Force accounted to be on:%s' % accounted
           break
        else:
           j=j+1
@@ -1368,10 +1624,9 @@ def RemoveDup(duplicate):
     if (accounted == 0):
       if val not in final_list:
         final_list.append(val)
-        ##print ' end block -- appended val to list: %s' % val
       else:
         # it should now never actually get here!
-        print 'SHOULD NEVER GET HERE  ----- found duplicate: %s' % val
+        print('SHOULD NEVER GET HERE  ----- found duplicate: %s' % val)
 
   return final_list
 
@@ -1389,67 +1644,54 @@ def config_load_defaults():
         config['status_log'] = str(DEFAULT_STATUS_LOG)
 
 def config_print():
-    log('VmBackup.py running with these settings:')
+    log('VmBackup.py %s running with these settings:' % VERSION)
     log('  backup_dir        = %s' % config['backup_dir'])
     log('  status_log        = %s' % config['status_log'])
     log('  compress          = %s' % compress)
     log('  max_backups       = %s' % config['max_backups'])
     log('  vdi_export_format = %s' % config['vdi_export_format'])
     log('  pool_db_backup    = %s' % config['pool_db_backup'])
+    log('  secrets_file      = %s (%s)' % (secrets_file, 'loaded' if secrets else 'not found'))
+    log('  mail_to           = %s (%s)' % (mail_setting('mail_to', MAIL_TO_ADDR) or '-', mail_setting('mail_mode') or DEFAULT_MAIL_MODE))
+    log('  api_report        = %s (%s)' % ('on' if api_report_wanted() else 'off', config_value('api_url') or DEFAULT_API_URL))
 
     log('  exclude (cnt)= %s' % len(config['exclude']))
-    str = ''
-    for vm_parm in sorted(config['exclude']):
-        str += '%s, ' % vm_parm
-    if len(str) > 1:
-        str = str[:-2]
-    log('  exclude: %s' % str)
+    log('  exclude: %s' % ', '.join(sorted(config['exclude'])))
 
     log('  vdi-export (cnt)= %s' % len(config['vdi-export']))
-    str = ''
-    for vm_parm in sorted(config['vdi-export']):
-        str += '%s, ' % vm_parm
-    if len(str) > 1:
-        str = str[:-2]
-    log('  vdi-export: %s' % str)
+    log('  vdi-export: %s' % ', '.join(sorted(config['vdi-export'])))
 
     log('  vm-export (cnt)= %s' % len(config['vm-export']))
-    str = ''
-    for vm_parm in sorted(config['vm-export']):
-        str += '%s, ' % vm_parm
-    if len(str) > 1:
-        str = str[:-2]
-    log('  vm-export: %s' % str)
+    log('  vm-export: %s' % ', '.join(sorted(config['vm-export'])))
+
+############################# status log
+
+def status_log_write(rec):
+    with open(config['status_log'], 'a') as f:
+        f.write(rec)
 
 def status_log_begin(server):
-    rec_begin = '%s,vmbackup.py,%s,begin\n' % (fmtDateTime(), server)
-    open(config['status_log'],'a',0).write(rec_begin)
+    status_log_write('%s,vmbackup.py,%s,begin\n' % (fmtDateTime(), server))
 
 def status_log_end(server, status):
-    rec_end = '%s,vmbackup.py,%s,end,%s\n' % (fmtDateTime(), server, status)
-    open(config['status_log'],'a',0).write(rec_end)
+    status_log_write('%s,vmbackup.py,%s,end,%s\n' % (fmtDateTime(), server, status))
 
 def status_log_vm_export_begin(server, status):
-    rec_begin = '%s,vm-export,%s,begin,%s\n' % (fmtDateTime(), server, status)
-    open(config['status_log'],'a',0).write(rec_begin)
+    status_log_write('%s,vm-export,%s,begin,%s\n' % (fmtDateTime(), server, status))
 
 def status_log_vm_export_end(server, status):
-    rec_end = '%s,vm-export,%s,end,%s\n' % (fmtDateTime(), server, status)
-    open(config['status_log'],'a',0).write(rec_end)
+    status_log_write('%s,vm-export,%s,end,%s\n' % (fmtDateTime(), server, status))
 
 def status_log_vdi_export_begin(server, status):
-    rec_begin = '%s,vdi-export,%s,begin,%s\n' % (fmtDateTime(), server, status)
-    open(config['status_log'],'a',0).write(rec_begin)
+    status_log_write('%s,vdi-export,%s,begin,%s\n' % (fmtDateTime(), server, status))
 
 def status_log_vdi_export_end(server, status):
-    rec_end = '%s,vdi-export,%s,end,%s\n' % (fmtDateTime(), server, status)
-    open(config['status_log'],'a',0).write(rec_end)
+    status_log_write('%s,vdi-export,%s,end,%s\n' % (fmtDateTime(), server, status))
 
 def fmtDateTime():
     date = datetime.datetime.today()
-    str = '%02d/%02d/%02d %02d:%02d:%02d' \
+    return '%02d/%02d/%02d %02d:%02d:%02d' \
         % (date.year, date.month, date.day, date.hour, date.minute, date.second)
-    return str
 
 def log(mes, log_w_timestamp=True):
     # note - send_email uses message
@@ -1457,133 +1699,184 @@ def log(mes, log_w_timestamp=True):
 
     date = datetime.datetime.today()
     if log_w_timestamp:
-        str = '%02d-%02d-%02d-(%02d:%02d:%02d) - %s\n' \
+        text = '%02d-%02d-%02d-(%02d:%02d:%02d) - %s\n' \
             % (date.year, date.month, date.day, date.hour, date.minute, date.second, mes)
     else:
-        str = '%s\n' % mes
-    message += str
+        text = '%s\n' % mes
+    message += text
 
-    #if verbose: (old option, now always verbose)
-    str = str.rstrip("\n")
-    print str
-    sys.stdout.flush()
-    sys.stderr.flush()
+    print(text.rstrip("\n"), flush=True)
 
 def run(cmd, do_log=True):
-    proc = subprocess.Popen(cmd, stdout=PIPE, stderr=STDOUT, shell=True)
-    res = proc.wait()
+    proc = subprocess.Popen(cmd, stdout=PIPE, stderr=STDOUT, shell=True, universal_newlines=True)
+    out = proc.communicate()[0]
+    res = proc.returncode
     if (res):
       if (do_log):
           log('ERROR for cmd %s' % cmd)
-          log(''.join(proc.stdout.readlines()))
+          log(out)
       return False
 
-    return proc.stdout
+    return True
+
+############################# usage
 
 def usage():
-    print 'Usage-basic:'
-    print sys.argv[0], ' <password> <config-file|vm-selector> [preview] [other optional params]'
-    print
-    print 'see also: VmBackup.py help    - for additional parameter usage'
-    print '      or: VmBackup.py config  - for config-file parameter usage'
-    print '      or: VmBackup.py example - for some simple example usage'
-    print
+    print('Usage-basic:')
+    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [other optional params]')
+    print()
+    print('see also: VmBackup.py help    - for additional parameter usage')
+    print('      or: VmBackup.py config  - for config-file parameter usage')
+    print('      or: VmBackup.py example - for some simple example usage')
+    print()
 
 def usage_help():
-    print 'Usage-help:'
-    print sys.argv[0], ' <password|password-file> <config-file|vm-selector> [preview] [other optional params]'
-    print
-    print 'required params:'
-    print '  <password|password-file> - xenserver password or obscured password stored in password-file'
-    print '  <config-file|vm-selector> - several options:'
-    print '    config-file - a common choice for production crontab execution'
-    print '    vm-selector - a single vm name or a vm reqular expression that defaults to vm-export'
-    print '      note with vm-selector then config defaults are set from VmBackup.py default constantants'
-    print '    vm-export=vm-selector  - explicit vm-export'
-    print '    vdi-export=vm-selector - explicit vdi-export'
-    print
-    print 'optional params:'
-    print '  [preview] - preview/validate VmBackup config parameters and xenserver password'
-    print '  [compress=True|False] - only for vm-export functions automatic compression (default: False)'
-    print '  [ignore_extra_keys=True|False] - some config files may have extra params (default: False)'
-    print '  [pre_clean=True|False] - delete older backup(s) before performing new backup (default: False)'
-    print
-    print 'alternate form - create-password-file:'
-    print sys.argv[0], ' <password> create-password-file=filename'
-    print
-    print '  create-password-file=filename - create an obscured password file with the specified password'
-    print '  note - password filename is relative to current path or absolute path.'
-    print
+    print('Usage-help:')
+    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [other optional params]')
+    print()
+    print('required params:')
+    print('  <password|password-file|local> - xenserver root password, an obscured password stored in password-file,')
+    print('      or the word "local" to use the local XenAPI unix socket (no password, run as root on the host)')
+    print('  <config-file|vm-selector> - several options:')
+    print('    config-file - a common choice for production crontab execution')
+    print('    vm-selector - a single vm name or a vm reqular expression that defaults to vm-export')
+    print('      note with vm-selector then config defaults are set from VmBackup.py default constantants')
+    print('    vm-export=vm-selector  - explicit vm-export')
+    print('    vdi-export=vm-selector - explicit vdi-export')
+    print()
+    print('optional params:')
+    print('  [preview] - preview/validate VmBackup config parameters and xenserver password')
+    print('  [compress=none|gzip|zstd] - vm-export compression (default: none; true=gzip, false=none;')
+    print('      zstd needs XCP-ng 8.1+). Can also be set in the config file as compress=')
+    print('  [ignore_extra_keys=True|False] - some config files may have extra params (default: False)')
+    print('  [pre_clean=True|False] - delete older backup(s) before performing new backup (default: False)')
+    print('  [secrets_file=PATH] - key=value file with mailuser, mailpass, api_token (default: %s)' % DEFAULT_SECRETS_FILE)
+    print()
+    print('exit codes: 0 success, 1 warnings, 2 errors (or fatal configuration problem)')
+    print()
+    print('alternate form - create-password-file:')
+    print(sys.argv[0], ' <password> create-password-file=filename')
+    print()
+    print('  create-password-file=filename - create an obscured password file with the specified password')
+    print('  note - password filename is relative to current path or absolute path.')
+    print()
 
 def usage_config_file():
-    print 'Usage-config-file:'
-    print
-    print '  # Example config file for VmBackup.py'
-    print
-    print '  #### high level VmBackup settings ################'
-    print '  #### note - if any of these are not specified ####'
-    print '  ####   then VmBackup uses default constants   ####'
-    print
-    print '  # Take Xen Pool DB backup: 0=No, 1=Yes (script default to 0=No)'
-    print '  pool_db_backup=0'
-    print
-    print '  # How many backups to keep for each vm (script default to 4)'
-    print '  max_backups=3'
-    print
-    print '  #Backup Directory path (script default /snapshots/BACKUPS)'
-    print '  backup_dir=/path/to/backupspace'
-    print
-    print '  # applicable if vdi-export is used'
-    print '  # vdi_export_format either raw or vhd (script default to raw)'
-    print '  vdi_export_format=raw'
-    print
-    print '  #### specific VMs backup settings ####'
-    print
-    print '  # vm-export VM name-label of vm to backup. One per line - notice :max_backups override.'
-    print '  vm-export=my-vm-name'
-    print '  vm-export=my-second-vm'
-    print '  vm-export=my-third-vm:3'
-    print
-    print '  # special vdi-export - only backs up first disk. See README Documenation!'
-    print '  vdi-export=my-vm-name'
-    print
-    print '  # vm-export using VM regular expression - notice DEV.* has :max_backups overide'
-    print '  vm-export=PROD.*'
-    print '  vm-export=DEV.*:2'
-    print
-    print '  # exclude specific VMs'
-    print '  exclude=PROD-WinDomainController'
-    print '  exclude=DEV-DestructiveTest'
-    print
+    print('Usage-config-file:')
+    print()
+    print('  # Example config file for VmBackup.py')
+    print()
+    print('  #### high level VmBackup settings ################')
+    print('  #### note - if any of these are not specified ####')
+    print('  ####   then VmBackup uses default constants   ####')
+    print()
+    print('  # Take Xen Pool DB backup: 0=No, 1=Yes (script default to 0=No)')
+    print('  pool_db_backup=0')
+    print()
+    print('  # How many backups to keep for each vm (script default to 4)')
+    print('  max_backups=3')
+    print()
+    print('  #Backup Directory path (script default /snapshots/BACKUPS)')
+    print('  backup_dir=/path/to/backupspace')
+    print()
+    print('  # vm-export compression: none, gzip or zstd (zstd needs XCP-ng 8.1+)')
+    print('  compress=zstd')
+    print()
+    print('  # applicable if vdi-export is used')
+    print('  # vdi_export_format either raw or vhd (script default to raw)')
+    print('  vdi_export_format=raw')
+    print()
+    print('  # mail report (credentials in the secrets file as mailuser= / mailpass=)')
+    print('  mail_to=backup@example.com')
+    print('  mail_from=host@example.com')
+    print('  mail_smtp_server=mail.example.com')
+    print('  mail_smtp_port=587')
+    print('  mail_mode=always      # always | problems | never')
+    print()
+    print('  # JSON report to the itsdave backup API (token in the secrets file as api_token=)')
+    print('  api_url=https://backupapi.itsdave.de/api/v1')
+    print('  api_hostname=host.example.com   # default: this hosts FQDN')
+    print('  api_report=true')
+    print()
+    print('  #### specific VMs backup settings ####')
+    print()
+    print('  # vm-export VM name-label of vm to backup. One per line - notice :max_backups override.')
+    print('  vm-export=my-vm-name')
+    print('  vm-export=my-second-vm')
+    print('  vm-export=my-third-vm:3')
+    print()
+    print('  # special vdi-export - only backs up first disk. See README Documenation!')
+    print('  vdi-export=my-vm-name')
+    print()
+    print('  # vm-export using VM regular expression - notice DEV.* has :max_backups overide')
+    print('  vm-export=PROD.*')
+    print('  vm-export=DEV.*:2')
+    print()
+    print('  # exclude specific VMs')
+    print('  exclude=PROD-WinDomainController')
+    print('  exclude=DEV-DestructiveTest')
+    print()
+    print('  # disks whose VDI name-label starts with [NOBAK] are never exported')
+    print()
 
 def usage_examples():
-    print 'Usage-examples:'
-    print
-    print '  # config file'
-    print '  ./VmBackup.py password weekend.cfg'
-    print
-    print '  # single VM name, which is case sensitive'
-    print '  ./VmBackup.py password DEV-mySql'
-    print
-    print '  # single VM name using vdi-export instead of vm-export'
-    print '  ./VmBackup.py password vdi-export=DEV-mySql'
-    print
-    print '  # single VM name with spaces in name'
-    print '  ./VmBackup.py password "DEV mySql"'
-    print
-    print '  # VM regular expression - which may be more than one VM'
-    print '  ./VmBackup.py password DEV-my.*'
-    print
-    print '  # all VMs in pool'
-    print '  ./VmBackup.py password ".*"'
-    print
-    print 'Alternate form - create-password-file:'
-    print '  # create password file from command line password'
-    print '  ./VmBackup.py password create-password-file=/root/VmBackup.pass'
-    print
-    print '  # use password file + config file'
-    print '  ./VmBackup.py /root/VmBackup.pass monthly.cfg'
-    print
+    print('Usage-examples:')
+    print()
+    print('  # config file, local XenAPI socket (run as root on the host)')
+    print('  ./VmBackup.py local weekend.cfg compress=zstd')
+    print()
+    print('  # single VM name, which is case sensitive')
+    print('  ./VmBackup.py password DEV-mySql')
+    print()
+    print('  # single VM name using vdi-export instead of vm-export')
+    print('  ./VmBackup.py password vdi-export=DEV-mySql')
+    print()
+    print('  # single VM name with spaces in name')
+    print('  ./VmBackup.py password "DEV mySql"')
+    print()
+    print('  # VM regular expression - which may be more than one VM')
+    print('  ./VmBackup.py password DEV-my.*')
+    print()
+    print('  # all VMs in pool')
+    print('  ./VmBackup.py password ".*"')
+    print()
+    print('Alternate form - create-password-file:')
+    print('  # create password file from command line password')
+    print('  ./VmBackup.py password create-password-file=/root/VmBackup.pass')
+    print()
+    print('  # use password file + config file')
+    print('  ./VmBackup.py /root/VmBackup.pass monthly.cfg')
+    print()
+
+def normalize_compress(value):
+    value = str(value).strip().lower()
+    if value in ('true', 'gzip', 'gz'):
+        return 'gzip'
+    if value in ('false', 'none', 'no', 'off', ''):
+        return 'none'
+    return value
+
+def open_session(password):
+    # "local": unix socket of the local xapi, no password needed. Otherwise https to localhost
+    # (ignore_ssl because the host certificate is self-signed) with fallback to the pool master.
+    if password == 'local':
+        s = XenAPI.xapi_local()
+        s.xenapi.login_with_password('root', '')
+        return s
+    try:
+        s = XenAPI.Session('https://localhost/', ignore_ssl=True)
+        s.xenapi.login_with_password('root', password)
+        s.xenapi.host.get_all()
+        return s
+    except XenAPI.Failure as e:
+        print(e)
+        if e.details[0] == 'HOST_IS_SLAVE':
+            s = XenAPI.Session('https://' + e.details[1], ignore_ssl=True)
+            s.xenapi.login_with_password('root', password)
+            s.xenapi.host.get_all()
+            return s
+        print('ERROR - XenAPI authentication error')
+        sys.exit(2)
 
 if __name__ == '__main__':
     if 'help' in sys.argv or 'config' in sys.argv or 'example' in sys.argv:
@@ -1597,36 +1890,44 @@ if __name__ == '__main__':
     password = sys.argv[1]
     cfg_file = sys.argv[2]
     # obscure password support
-    if (os.path.exists(password)):
-        password = base64.b64decode(open(password, 'r').read())
+    if password != 'local' and (os.path.exists(password)):
+        with open(password, 'r') as f:
+            password = base64.b64decode(f.read()).decode('utf-8')
     if cfg_file.lower().startswith('create-password-file'):
         array = sys.argv[2].strip().split('=')
-        open(array[1], 'w').write(base64.b64encode(password))
-        print 'password file saved to: %s' % array[1]
+        with open(array[1], 'w') as f:
+            f.write(base64.b64encode(password.encode('utf-8')).decode('ascii'))
+        os.chmod(array[1], 0o600)
+        print('password file saved to: %s' % array[1])
         sys.exit(0)
 
     # load optional params
     preview = False                 # default
-    compress = False                # default
+    compress = None                 # default: from config file, else DEFAULT_COMPRESS
     ignore_extra_keys = False       # default
-    pre_clean = False             # default
+    pre_clean = False               # default
+    secrets_file = DEFAULT_SECRETS_FILE
 
     # loop through remaining optional args
     arg_range = range(3,len(sys.argv))
     for arg_ix in arg_range:
-        array = sys.argv[arg_ix].strip().split('=')
+        array = sys.argv[arg_ix].strip().split('=', 1)
         if array[0].lower() == 'preview':
             preview = True
         elif array[0].lower() == 'compress':
-            compress = (array[1].lower() == 'true')
+            compress = normalize_compress(array[1])
         elif array[0].lower() == 'ignore_extra_keys':
             ignore_extra_keys = (array[1].lower() == 'true')
         elif array[0].lower() == 'pre_clean':
             pre_clean = (array[1].lower() == 'true')
+        elif array[0].lower() == 'secrets_file':
+            secrets_file = array[1]
         else:
-            print 'ERROR invalid parm: %s' % sys.argv[arg_ix]
+            print('ERROR invalid parm: %s' % sys.argv[arg_ix])
             usage()
             sys.exit(1)
+
+    secrets = load_secrets(secrets_file)
 
     # init vm-export/vdi-export/exclude in config list
     config['vm-export'] = []
@@ -1644,8 +1945,8 @@ if __name__ == '__main__':
         if config_load(cfg_file):
             cleanup_vmexport_vdiexport_dups()
         else:
-            print 'ERROR in config_load, consider ignore_extra_keys=true'
-            sys.exit(1)
+            print('ERROR in config_load, consider ignore_extra_keys=true')
+            sys.exit(2)
     else:
         # no config file exists - so cfg_file is actual vm_name/prefix
         config_specified = 0
@@ -1654,39 +1955,26 @@ if __name__ == '__main__':
         if cmd_vm_name.count('=') == 1:
             (cmd_option,cmd_vm_name) = cmd_vm_name.strip().split('=')
         if cmd_option != 'vm-export' and cmd_option != 'vdi-export':
-            print 'ERROR invalid config/vm_name: %s' % cfg_file
+            print('ERROR invalid config/vm_name: %s' % cfg_file)
             usage()
             sys.exit(1)
         save_to_config_export( cmd_option, cmd_vm_name)
 
     config_load_defaults()  # set defaults that are not already loaded
+    if compress is None:
+        compress = normalize_compress(config_value('compress') or DEFAULT_COMPRESS)
     log('VmBackup config loaded from: %s' % cfg_file)
     config_print()     # show fully loaded config
 
     if not is_config_valid():
         log('ERROR in configuration settings...')
-        sys.exit(1)
+        sys.exit(2)
     if len(config['vm-export']) == 0 and len(config['vdi-export']) == 0 :
         log('ERROR no VMs loaded')
-        sys.exit(1)
+        sys.exit(2)
 
     # acquire a xapi session by logging in
-    try:
-        username = 'root'
-        session = XenAPI.Session('http://localhost/')
-        # print "session is: %s " % session
-
-        session.xenapi.login_with_password(username, password)
-        hosts = session.xenapi.host.get_all()
-    except XenAPI.Failure, e:
-        print e
-        if e.details[0] == 'HOST_IS_SLAVE':
-            session = XenAPI.Session('http://' + e.details[1])
-            session.xenapi.login_with_password(username, password)
-            hosts = session.xenapi.host.get_all()
-        else:
-            print 'ERROR - XenAPI authentication error'
-            sys.exit(1)
+    session = open_session(password)
 
     if preview:
     # check for duplicate names
@@ -1698,20 +1986,17 @@ if __name__ == '__main__':
 
     if not verify_config_vms_exist():
         # error message(s) printed in verify_config_vms_exist
-        sys.exit(1)
-    # OPTIONAL
-    #show_vms_not_in_backup()
+        sys.exit(2)
 
-    # todo - these warning/errors are a little confusing, clean these up later
     if preview:
         warning = ''
         if warning_match:
             warning = ' - WARNINGS found (see above)'
         if error_regex:
             log('ERROR regex errors found (see above) %s' % warning)
-            sys.exit(1)
+            sys.exit(2)
         log('SUCCESS preview of parameters %s' % warning)
-        sys.exit(1)
+        sys.exit(1 if warning_match else 0)
 
     warning = ''
     if warning_match:
@@ -1719,14 +2004,20 @@ if __name__ == '__main__':
     log('SUCCESS check of parameters %s' % warning)
     if error_regex:
         log('ERROR regex errors found (see above)')
-        sys.exit(1)
+        sys.exit(2)
 
+    rc = 2
     try:
-        main(session)
+        rc = main(session)
 
-    except Exception, e:
-        print e
+    except Exception as e:
+        print(e)
         log('***ERROR EXCEPTION - %s' % sys.exc_info()[0])
         log('***ERROR NOTE: see VmBackup output for details')
         raise
-    session.logout
+    finally:
+        try:
+            session.xenapi.session.logout()
+        except Exception:
+            pass
+    sys.exit(rc)

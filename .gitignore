@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.secrets
+status.log
+last_report.json
+target_state
