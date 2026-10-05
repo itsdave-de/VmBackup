@@ -730,10 +730,10 @@ def report_finish(server_name, run_begin, run_end, overall, success_cnt, warning
     ok, answer = post_report(api_url + '/backup', token, hostname, data)
     if ok:
         log('report sent to %s as %s: %s' % (api_url, hostname, answer[:200]))
-        data['run']['api_report'] = 'sent'
+        data['run']['api_report'] = 'gesendet'
     else:
         log('WARNING report NOT sent to %s: %s' % (api_url, answer[:300]))
-        data['run']['api_report'] = 'failed: %s' % answer[:120]
+        data['run']['api_report'] = 'FEHLER: %s' % answer[:120]
     return data
 
 def api_report_wanted():
@@ -1266,7 +1266,7 @@ def build_mail(data, status_log_file, overall):
             v.get('name', '')[:24], VM_MARK.get(v.get('status'), v.get('status')),
             fmt_duration(v.get('duration_sec')), fmt_bytes(v.get('size_bytes')) if v.get('size_bytes') is not None else '-',
             v.get('copies') if v.get('copies') is not None else '-',
-            ('  (%s)' % v.get('message')) if v.get('status') != 'success' and v.get('message') else ''))
+            ('  (%s)' % v.get('message')) if v.get('message') and v.get('message') not in ('SUCCESS', 'WARNING') else ''))
         if v.get('excluded_disks'):
             lines.append('%-24s   ausgelassen: %s' % ('', ', '.join(v['excluded_disks'])))
     lines.append('')
@@ -1291,7 +1291,7 @@ def build_mail(data, status_log_file, overall):
     for v in vms:
         vc = STATUS_COLOR.get(v.get('status'), '#616161')
         extra = ''
-        if v.get('status') != 'success' and v.get('message'):
+        if v.get('message') and v.get('message') not in ('SUCCESS', 'WARNING'):
             extra += '<div style="color:%s;font-size:12px">%s</div>' % (vc, _esc(v.get('message')))
         if v.get('excluded_disks'):
             extra += '<div style="color:#616161;font-size:12px">ausgelassen: %s</div>' % _esc(', '.join(v['excluded_disks']))
