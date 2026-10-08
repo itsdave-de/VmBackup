@@ -124,6 +124,8 @@ xe_path = '/opt/xensource/bin'
 
 # collected for the JSON report (schema naubackup-v1)
 report = {'vms': [], 'pool_metadata': {'enabled': False, 'success': None}}
+run_notes = []        # run-level hints for the report mail (space forecast etc.), turn success into warning
+abort_reason = ''     # set by abort=<reason>: report only, no backup
 
 def main(session):
 
@@ -398,6 +400,26 @@ def main(session):
         # cleanup any old unsuccessful backups and create new full_backup_dir
         full_backup_dir = process_backup_dir(vm_backup_dir)
 
+        # disk full? compare free space with the size of the newest restorable copy of this VM
+        need = newest_copy_size(vm_backup_dir)
+        avail = free_bytes(config['backup_dir'])
+        if need and avail is not None and avail < need:
+            text = 'PLATTE VOLL: %s frei, mindestens %s noetig (Groesse der letzten Kopie) - Export nicht gestartet' % (fmt_bytes(avail), fmt_bytes(need))
+            log('ERROR %s' % text)
+            remove_backup_dir(full_backup_dir)
+            fill_copies(vm_report, vm_backup_dir)
+            if config_specified:
+                status_log_vm_export_end(server_name, 'ERROR disk-full %s' % vm_name)
+            error_cnt += 1
+            report_vm_end(vm_report, 'error', text)
+            # next vm
+            continue
+        if need and avail is not None and avail < need * 1.2:
+            note = '%s: Platz wird knapp, %s frei bei %s fuer die letzte Kopie' % (vm_name, fmt_bytes(avail), fmt_bytes(need))
+            log('WARNING %s' % note)
+            run_notes.append(note)
+        export_log_pos = len(message)
+
         # gather_vm_meta produces status: empty or warning-message
         #   and globals: vm_uuid, xvda_uuid, xvda_uuid
         vm_meta_status = gather_vm_meta(vm_object, full_backup_dir)
@@ -495,10 +517,20 @@ def main(session):
             log('vm-export success')
         else:
             log('ERROR %s' % cmd)
+            avail = free_bytes(config['backup_dir'])
+            if 'No space left' in message[export_log_pos:] or 'ENOSPC' in message[export_log_pos:] or (avail is not None and avail < 256 * 1024 * 1024):
+                text = 'PLATTE VOLL beim Export (%s frei) - unvollstaendige Kopie geloescht' % fmt_bytes(avail)
+            else:
+                text = 'VM-EXPORT-FAIL - unvollstaendige Kopie geloescht'
+            log('ERROR %s' % text)
+            remove_backup_dir(full_backup_dir)
+            fill_copies(vm_report, vm_backup_dir)
+            # the snapshot would otherwise stay behind until the next run cleans it up
+            run_log_out_wait_rc('%s/xe vm-uninstall uuid=%s force=true' % (xe_path, snap_vm_uuid))
             if config_specified:
                 status_log_vm_export_end(server_name, 'VM-EXPORT-FAIL %s' % vm_name)
             error_cnt += 1
-            report_vm_end(vm_report, 'error', 'VM-EXPORT-FAIL')
+            report_vm_end(vm_report, 'error', text)
             # next vm
             continue
 
@@ -557,6 +589,19 @@ def main(session):
     log('===========================')
     df_snapshots('Space status: df -Th %s' % config['backup_dir'])
 
+    # will the next run fit? NAUbackup deletes old copies only after a successful export,
+    # so the next run needs free space for one more copy of every VM
+    need_next = 0
+    for vm_parm in config['vm-export']:
+        need_next += newest_copy_size(os.path.join(config['backup_dir'], get_vm_name(vm_parm))) or 0
+    avail = free_bytes(config['backup_dir'])
+    if need_next and avail is not None and avail < need_next:
+        run_notes.append('Platz reicht voraussichtlich nicht fuer den naechsten Lauf: %s frei, etwa %s noetig - Platte wechseln oder alte Kopien loeschen' % (fmt_bytes(avail), fmt_bytes(need_next)))
+    elif need_next and avail is not None and avail < need_next * 1.2:
+        run_notes.append('Platz fuer den naechsten Lauf wird knapp: %s frei, etwa %s noetig' % (fmt_bytes(avail), fmt_bytes(need_next)))
+    for note in run_notes:
+        log('WARNING %s' % note)
+
     # gather a final VmBackup.py status
     summary = 'S:%s W:%s E:%s' % (success_cnt, warning_cnt, error_cnt)
     status_log = config['status_log']
@@ -565,7 +610,7 @@ def main(session):
         if config_specified:
             status_log_end(server_name, 'ERROR,%s' % summary)
         log('VmBackup ended - **ERRORS DETECTED** - %s' % summary)
-    elif (warning_cnt > 0):
+    elif (warning_cnt > 0) or run_notes:
         overall = 'warning'
         if config_specified:
             status_log_end(server_name, 'WARNING,%s' % summary)
@@ -584,24 +629,85 @@ def main(session):
     except Exception as e:
         log('WARNING report could not be built or sent: %s' % e)
 
-    if mail_wanted(overall):
-        word = {'error': 'ERROR', 'warning': 'WARNING', 'success': 'Success'}[overall]
-        subject = '%s %s VmBackup.py' % (word, os.uname()[1])
-        if data:
-            subject += ' - %s/%s VMs, %s, %s' % (success_cnt, data['run']['vm_count_configured'],
-                                                 fmt_bytes(sum(_num(v.get('size_bytes')) for v in data['vms'])),
-                                                 fmt_duration(data['run']['duration_sec']))
-        text, html = build_mail(data, status_log, overall)
-        attachments = []
-        try:
-            attachments.append(build_log_attachment(data, status_log, run_begin))
-        except Exception as e:
-            log('WARNING log attachment could not be built: %s' % e)
-        send_email(mail_setting('mail_to', MAIL_TO_ADDR), subject, text, html, attachments)
-        if config_specified:
-            open('%s' % status_log, 'w').close() # trunc status log after email
+    send_report_mail(data, status_log, overall, success_cnt, run_begin)
 
     return {'error': 2, 'warning': 1, 'success': 0}[overall]
+
+def send_report_mail(data, status_log, overall, success_cnt, run_begin):
+    if not mail_wanted(overall):
+        return
+    word = {'error': 'ERROR', 'warning': 'WARNING', 'success': 'Success'}[overall]
+    subject = '%s %s VmBackup.py' % (word, os.uname()[1])
+    if abort_reason:
+        subject += ' - ABGEBROCHEN: %s' % abort_reason
+    elif data:
+        subject += ' - %s/%s VMs, %s, %s' % (success_cnt, data['run']['vm_count_configured'],
+                                             fmt_bytes(sum(_num(v.get('size_bytes')) for v in data['vms'])),
+                                             fmt_duration(data['run']['duration_sec']))
+    text, html = build_mail(data, status_log, overall)
+    attachments = []
+    try:
+        attachments.append(build_log_attachment(data, status_log, run_begin))
+    except Exception as e:
+        log('WARNING log attachment could not be built: %s' % e)
+    send_email(mail_setting('mail_to', MAIL_TO_ADDR), subject, text, html, attachments)
+    if config_specified:
+        open('%s' % status_log, 'w').close() # trunc status log after email
+
+def abort_report(reason):
+    """abort=<reason>: nothing was backed up (no disk, LUKS/mount failed, ...). Report it by mail and API, exit 2."""
+    now = datetime.datetime.now()
+    server_name = os.uname()[1].split('.')[0]
+    log('===========================')
+    log('VmBackup %s on %s - ABGEBROCHEN, bevor gesichert wurde: %s' % (VERSION, server_name, reason))
+    if config_specified:
+        status_log_begin(server_name)
+    vm_count = 0
+    for mode in ('vm-export', 'vdi-export'):
+        for vm_parm in config[mode]:
+            entry = report_vm_begin(get_vm_name(vm_parm), mode, get_vm_max_backups(vm_parm), now)
+            report_vm_end(entry, 'error', 'nicht gesichert: %s' % reason)
+            vm_count += 1
+    summary = 'S:0 W:0 E:%s' % vm_count
+    if config_specified:
+        status_log_end(server_name, 'ERROR,abort: %s,%s' % (reason, summary))
+    log('VmBackup ended - **ABORTED** - %s' % summary)
+    data = None
+    try:
+        data = report_finish(server_name, now, datetime.datetime.now(), 'error', 0, 0, vm_count)
+    except Exception as e:
+        log('WARNING report could not be built or sent: %s' % e)
+    send_report_mail(data, config['status_log'], 'error', 0, now)
+    return 2
+
+def free_bytes(path):
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return None
+
+def newest_copy_size(vm_backup_dir):
+    # size of the newest restorable copy of a VM, None if there is none yet
+    if not os.path.isdir(vm_backup_dir):
+        return None
+    good = [c for c in backup_copies(vm_backup_dir) if c['success'] and c['size_bytes']]
+    if not good:
+        return None
+    return sorted(good, key=lambda c: c['dir'])[-1]['size_bytes']
+
+def fill_copies(vm_report, vm_backup_dir):
+    vm_report['copies_detail'] = backup_copies(vm_backup_dir) if os.path.isdir(vm_backup_dir) else []
+    vm_report['copies'] = len([c for c in vm_report['copies_detail'] if c['success']])
+    vm_report['on_disk_bytes'] = sum(c['size_bytes'] for c in vm_report['copies_detail'])
+
+def remove_backup_dir(path):
+    try:
+        if path and os.path.isdir(path):
+            shutil.rmtree(path)
+            log('removed %s' % path)
+    except OSError as e:
+        log('WARNING could not remove %s: %s' % (path, e))
 
     # done with main()
     ######################################################################
@@ -736,6 +842,8 @@ def report_finish(server_name, run_begin, run_end, overall, success_cnt, warning
             'config_file': cfg_file if config_specified else None,
             'compress': compress,
             'vm_count_configured': len(config['vm-export']) + len(config['vdi-export']),
+            'notes': list(run_notes),
+            'abort_reason': abort_reason or None,
         },
         'target': target_info(config['backup_dir']),
         'pool_metadata': report['pool_metadata'],
@@ -1317,6 +1425,13 @@ def build_mail(data, status_log_file, overall):
             lines.append('%-24s   ausgelassen: %s' % ('', ', '.join(v['excluded_disks'])))
     on_disk_total = sum(_num(v.get('on_disk_bytes')) for v in vms)
     lines.append('')
+    if run.get('abort_reason'):
+        lines.append('ABGEBROCHEN, NICHTS GESICHERT: %s' % run['abort_reason'])
+        lines.append('')
+    for note in run.get('notes') or []:
+        lines.append('HINWEIS: %s' % note)
+    if run.get('notes'):
+        lines.append('')
     lines.append('Ziel: %s%s' % (ziel.get('backup_dir'), (' auf %s' % state.get('target_id')) if state.get('target_id') else ''))
     if used_pct is not None:
         lines.append('      %s belegt, %s frei von %s (%s %%); diese VMs mit allen Kopien: %s' % (fmt_bytes(ziel.get('used_bytes')), fmt_bytes(ziel.get('avail_bytes')), fmt_bytes(ziel.get('size_bytes')), used_pct, fmt_bytes(on_disk_total)))
@@ -1376,6 +1491,10 @@ def build_mail(data, status_log_file, overall):
         ('Ziel', '%s%s%s' % (_esc(ziel.get('backup_dir')), (' auf <code>%s</code>' % _esc(state.get('target_id'))) if state.get('target_id') else '',
                              (' (S/N %s)' % _esc(state.get('target_serial'))) if state.get('target_serial') else '') + bar),
     ]
+    if run.get('abort_reason'):
+        facts.insert(0, ('Abbruch', '<b style="color:%s">Nichts gesichert: %s</b>' % (STATUS_COLOR['error'], _esc(run['abort_reason']))))
+    if run.get('notes'):
+        facts.append(('Hinweise', '<br>'.join('<span style="color:%s">%s</span>' % (STATUS_COLOR['warning'], _esc(n)) for n in run['notes'])))
     if pm.get('enabled'):
         facts.append(('Pool-Metadaten', '<span style="color:%s">%s</span>' % (STATUS_COLOR['success'] if pm.get('success') else STATUS_COLOR['error'], 'gesichert' if pm.get('success') else 'FEHLER')))
     if run.get('api_report'):
@@ -1962,7 +2081,7 @@ def run(cmd, do_log=True):
 
 def usage():
     print('Usage-basic:')
-    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [other optional params]')
+    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [abort=<grund>] [other optional params]')
     print()
     print('see also: VmBackup.py help    - for additional parameter usage')
     print('      or: VmBackup.py config  - for config-file parameter usage')
@@ -1971,7 +2090,7 @@ def usage():
 
 def usage_help():
     print('Usage-help:')
-    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [other optional params]')
+    print(sys.argv[0], ' <password|password-file|local> <config-file|vm-selector> [preview] [abort=<grund>] [other optional params]')
     print()
     print('required params:')
     print('  <password|password-file|local> - xenserver root password, an obscured password stored in password-file,')
@@ -2161,6 +2280,8 @@ if __name__ == '__main__':
             pre_clean = (array[1].lower() == 'true')
         elif array[0].lower() == 'secrets_file':
             secrets_file = array[1]
+        elif array[0].lower() == 'abort':
+            abort_reason = array[1].strip() or 'unbekannter Grund'
         else:
             print('ERROR invalid parm: %s' % sys.argv[arg_ix])
             usage()
@@ -2204,6 +2325,10 @@ if __name__ == '__main__':
         compress = normalize_compress(config_value('compress') or DEFAULT_COMPRESS)
     log('VmBackup config loaded from: %s' % cfg_file)
     config_print()     # show fully loaded config
+
+    if abort_reason:
+        # report only: the wrapper script could not provide the backup target
+        sys.exit(abort_report(abort_reason))
 
     if not is_config_valid():
         log('ERROR in configuration settings...')
