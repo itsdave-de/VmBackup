@@ -78,7 +78,9 @@
 #    ./VmBackup.py <password|local> <config-file-path>
 
 import sys, time, os, datetime, subprocess, re, shutil, smtplib, base64, socket, json, uuid as uuidlib
-import urllib.request, urllib.error
+import urllib.request, urllib.error, io, zipfile
+from email.mime.base import MIMEBase
+from email import encoders
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate
@@ -590,7 +592,12 @@ def main(session):
                                                  fmt_bytes(sum(_num(v.get('size_bytes')) for v in data['vms'])),
                                                  fmt_duration(data['run']['duration_sec']))
         text, html = build_mail(data, status_log, overall)
-        send_email(mail_setting('mail_to', MAIL_TO_ADDR), subject, text, html)
+        attachments = []
+        try:
+            attachments.append(build_log_attachment(data, status_log, run_begin))
+        except Exception as e:
+            log('WARNING log attachment could not be built: %s' % e)
+        send_email(mail_setting('mail_to', MAIL_TO_ADDR), subject, text, html, attachments)
         if config_specified:
             open('%s' % status_log, 'w').close() # trunc status log after email
 
@@ -1390,17 +1397,54 @@ def build_mail(data, status_log_file, overall):
     ) % (color, color, STATUS_WORD.get(overall, _esc(overall)), VERSION, fact_rows, ''.join(rows), _esc(status_text.rstrip()))
     return text, html
 
-def send_email(to, subject, body_text, body_html=None):
+def build_log_attachment(data, status_log_file, run_begin):
+    """ZIP with the log of this run only: detailed log (message), status.log and the JSON report."""
+    host = os.uname()[1].split('.')[0]
+    stamp = run_begin.strftime('%Y-%m-%d_%H%M')
+    base = 'naubackup-%s-%s' % (host, stamp)
+    try:
+        with open('%s' % status_log_file, 'r') as f:
+            status_text = f.read()
+    except OSError:
+        status_text = ''
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('%s/run.log' % base, message)
+        if status_text:
+            z.writestr('%s/status.log' % base, status_text)
+        if data:
+            z.writestr('%s/report.json' % base, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False))
+    return ('%s.zip' % base, buf.getvalue(), 'application/zip')
+
+def send_email(to, subject, body_text, body_html=None, attachments=None):
+    # one separate mail per recipient, so nobody sees who else gets the report
+    recipients = [a.strip() for a in str(to).split(',') if a.strip()]
+    for rcpt in recipients:
+        send_email_single(rcpt, subject, body_text, body_html, attachments)
+
+def send_email_single(to, subject, body_text, body_html=None, attachments=None):
 
     smtp_send_retries = 3
     smtp_send_attempt = 0
 
     if body_html:
-        msg = MIMEMultipart('alternative')
-        msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
-        msg.attach(MIMEText(body_html, 'html', 'utf-8'))
+        body = MIMEMultipart('alternative')
+        body.attach(MIMEText(body_text, 'plain', 'utf-8'))
+        body.attach(MIMEText(body_html, 'html', 'utf-8'))
     else:
-        msg = MIMEText(body_text, 'plain', 'utf-8')
+        body = MIMEText(body_text, 'plain', 'utf-8')
+    if attachments:
+        msg = MIMEMultipart('mixed')
+        msg.attach(body)
+        for filename, content, mimetype in attachments:
+            maintype, subtype = (mimetype or 'application/octet-stream').split('/', 1)
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(content)
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment', filename=filename)
+            msg.attach(part)
+    else:
+        msg = body
     msg['Subject'] = subject
     mail_from = mail_setting('mail_from', MAIL_FROM_ADDR)
     server = mail_setting('mail_smtp_server', MAIL_SMTP_SERVER)
@@ -1426,7 +1470,7 @@ def send_email(to, subject, body_text, body_html=None):
                     s.ehlo()
             if username:
                 s.login(username, password)
-            s.sendmail(mail_from, to.split(','), msg.as_string())
+            s.sendmail(mail_from, [to], msg.as_string())
             s.quit()
             log('mail sent to %s via %s:%s' % (to, server, port))
             break
@@ -1982,7 +2026,7 @@ def usage_config_file():
     print('  vdi_export_format=raw')
     print()
     print('  # mail report (credentials in the secrets file as mailuser= / mailpass=)')
-    print('  mail_to=backup@example.com')
+    print('  mail_to=backup@example.com,reporting@example.com   # comma separated, one separate mail per recipient')
     print('  mail_from=host@example.com')
     print('  mail_smtp_server=mail.example.com')
     print('  mail_smtp_port=587')
